@@ -8,6 +8,8 @@ The browser is getting **503 (Service Unavailable)** from the conversion server,
 ### 1. Open the Server Console
 Look at the terminal/console where you ran `npm run dev`. You should see logs from the RTSP converter server.
 
+> **New:** Each attempt now prints `🎬 Attempting FFmpeg profile "<name>" ...` and `✅ FFmpeg started with profile "<name>"`. If a profile fails it will print why before trying the next one. Share these lines when reporting issues so we know which pipeline succeeded/failed.
+
 ### 2. Look for These Messages
 
 #### ✅ Good Signs:

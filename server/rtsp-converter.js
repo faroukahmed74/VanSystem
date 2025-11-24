@@ -22,6 +22,159 @@ const activeStreams = new Map();
 // Health check interval to monitor FFmpeg processes
 let healthCheckInterval = null;
 
+const STREAM_IDLE_TIMEOUT_MS = parseInt(process.env.FFMPEG_IDLE_TIMEOUT_MS || '120000', 10); // stop idle streams after 2 min
+const FFMPEG_ANALYZE_DURATION = process.env.FFMPEG_ANALYZE_DURATION || '10000000';
+const FFMPEG_PROBE_SIZE = process.env.FFMPEG_PROBE_SIZE || '32M';
+const FFMPEG_HANDSHAKE_TIMEOUT = process.env.FFMPEG_HANDSHAKE_TIMEOUT || '15000000'; // microseconds (15s)
+const FFMPEG_RW_TIMEOUT = process.env.FFMPEG_RW_TIMEOUT || '15000000';
+const FORCED_FFMPEG_PROFILE = process.env.FFMPEG_PROFILE || null;
+
+const FFMPEG_PROFILES = [
+  {
+    name: 'copy-tcp',
+    description: 'Copy H.264 bitstream over TCP (lowest latency, lowest CPU)',
+    transport: 'tcp',
+    transcodeVideo: false,
+    preferTcp: true
+  },
+  {
+    name: 'transcode-tcp',
+    description: 'Transcode to H.264 baseline over TCP when copy fails',
+    transport: 'tcp',
+    transcodeVideo: true,
+    preferTcp: true
+  },
+  {
+    name: 'transcode-udp',
+    description: 'Fallback to UDP transport if TCP keeps failing',
+    transport: 'udp',
+    transcodeVideo: true,
+    preferTcp: false
+  }
+];
+
+function getStreamOutputPath(streamId) {
+  return path.join(HLS_OUTPUT_DIR, streamId);
+}
+
+function cleanupStreamArtifacts(streamId) {
+  const outputPath = getStreamOutputPath(streamId);
+  if (fs.existsSync(outputPath)) {
+    try {
+      fs.rmSync(outputPath, { recursive: true, force: true });
+      console.log(`🧹 Cleaned up output directory: ${outputPath}`);
+    } catch (error) {
+      console.error(`Error cleaning up output directory ${outputPath}:`, error.message);
+    }
+  }
+}
+
+function touchStreamAccess(streamId) {
+  const streamInfo = activeStreams.get(streamId);
+  if (streamInfo) {
+    streamInfo.lastRequestTime = Date.now();
+  }
+}
+
+function buildFfmpegArgs(rtspUrl, playlistPath, segmentPattern, profile) {
+  const transport = profile.transport || 'tcp';
+  const args = [
+    '-loglevel', 'info',
+    '-rtsp_transport', transport
+  ];
+
+  if (profile.preferTcp && transport === 'tcp') {
+    args.push('-rtsp_flags', 'prefer_tcp');
+  }
+
+  args.push(
+    '-analyzeduration', FFMPEG_ANALYZE_DURATION,
+    '-probesize', FFMPEG_PROBE_SIZE,
+    '-fflags', '+genpts',
+    '-max_delay', '500000',
+    '-use_wallclock_as_timestamps', '1',
+    '-thread_queue_size', '512',
+    '-i', rtspUrl
+  );
+
+  if (profile.transcodeVideo) {
+    args.push(
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-tune', 'zerolatency',
+      '-profile:v', 'baseline',
+      '-level', '3.0',
+      '-g', '30',
+      '-keyint_min', '30',
+      '-sc_threshold', '0',
+      '-max_muxing_queue_size', '1024'
+    );
+  } else {
+    args.push(
+      '-c:v', 'copy',
+      '-bsf:v', 'h264_mp4toannexb',
+      '-max_muxing_queue_size', '1024'
+    );
+  }
+
+  args.push(
+    '-c:a', 'aac',
+    '-ar', '44100',
+    '-b:a', '96k',
+    '-ac', '2',
+    '-hls_time', '2',
+    '-hls_list_size', '150',
+    '-hls_flags', 'delete_segments+omit_endlist+independent_segments',
+    '-hls_segment_type', 'mpegts',
+    '-hls_segment_filename', segmentPattern,
+    '-f', 'hls',
+    '-start_number', '0',
+    '-hls_allow_cache', '0',
+    playlistPath
+  );
+
+  return args;
+}
+
+function classifyFfmpegError(output) {
+  if (!output) return null;
+  const lower = output.toLowerCase();
+  if (lower.includes('connection refused')) {
+    return 'Camera refused the connection (offline or firewall blocked)';
+  }
+  if (lower.includes('operation not permitted')) {
+    return 'Operation not permitted - check firewall/ACLs for the RTSP port';
+  }
+  if (lower.includes('connection timed out')) {
+    return 'Connection timed out - camera unreachable or RTSP port closed';
+  }
+  if (lower.includes('server returned 5')) {
+    return 'Camera returned 5XX - device is overloaded or rejected the request';
+  }
+  if (lower.includes('play failed') || lower.includes('500internal')) {
+    return 'Camera returned 500 on PLAY - it cannot start streaming (camera bug or busy)';
+  }
+  if (lower.includes('end of file')) {
+    return 'Camera closed the RTSP socket (often single-connection limit)';
+  }
+  if (lower.includes('invalid data found')) {
+    return 'Camera sent invalid RTP data (often fixed by the new fallback profiles)';
+  }
+  if (lower.includes('missing picture') || lower.includes('no frame')) {
+    return 'Camera is streaming corrupted H.264 frames';
+  }
+  if (lower.includes('-10054') || lower.includes('connection reset')) {
+    return 'Connection reset by peer (-10054) - unstable network or cable unplugged';
+  }
+  if (lower.includes('404')) {
+    return 'Camera reported 404 - verify RTSP path';
+  }
+  if (lower.includes('401') || lower.includes('unauthorized')) {
+    return 'Camera rejected the credentials (401 Unauthorized)';
+  }
+  return null;
+}
+
 // Check if FFmpeg is available
 function checkFFmpeg() {
   return new Promise((resolve) => {
@@ -35,12 +188,42 @@ function checkFFmpeg() {
   });
 }
 
-// Convert RTSP to HLS
-function convertRTSPtoHLS(rtspUrl, streamId) {
+// Convert RTSP to HLS with automatic profile fallback
+async function convertRTSPtoHLS(rtspUrl, streamId) {
+  const profilesToTry = FORCED_FFMPEG_PROFILE
+    ? FFMPEG_PROFILES.filter(profile => profile.name === FORCED_FFMPEG_PROFILE)
+    : FFMPEG_PROFILES;
+
+  if (profilesToTry.length === 0) {
+    throw new Error(`FFmpeg profile "${FORCED_FFMPEG_PROFILE}" not found`);
+  }
+
+  let lastError = null;
+  for (let i = 0; i < profilesToTry.length; i += 1) {
+    const profile = profilesToTry[i];
+    console.log(`\n🎬 Attempting FFmpeg profile "${profile.name}" (${profile.description}) for stream ${streamId}`);
+    cleanupStreamArtifacts(streamId);
+
+    try {
+      await startFfmpegWithProfile(rtspUrl, streamId, profile);
+      console.log(`✅ FFmpeg started with profile "${profile.name}" for ${streamId}`);
+      return;
+    } catch (error) {
+      lastError = error;
+      console.error(`❌ Profile "${profile.name}" failed for stream ${streamId}: ${error.message}`);
+      // Try next profile if available
+      if (i < profilesToTry.length - 1) {
+        console.log('↪️  Trying next FFmpeg profile...');
+      }
+    }
+  }
+
+  throw lastError || new Error('All FFmpeg profiles failed to start');
+}
+
+function startFfmpegWithProfile(rtspUrl, streamId, profile) {
   return new Promise((resolve, reject) => {
-    const outputPath = path.join(HLS_OUTPUT_DIR, streamId);
-    
-    // Create directory for this stream
+    const outputPath = getStreamOutputPath(streamId);
     if (!fs.existsSync(outputPath)) {
       fs.mkdirSync(outputPath, { recursive: true });
     }
@@ -52,41 +235,12 @@ function convertRTSPtoHLS(rtspUrl, streamId) {
     console.log(`FFmpeg playlist path: ${playlistPath}`);
     console.log(`FFmpeg segment pattern: ${segmentPattern}`);
 
-    // FFmpeg command to convert RTSP to HLS
-    // Optimized for low latency and fast startup
-    const ffmpegArgs = [
-      '-rtsp_transport', 'tcp', // Use TCP for better reliability
-      '-fflags', 'nobuffer', // Disable buffering for low latency
-      '-flags', 'low_delay', // Low delay flag
-      '-strict', 'experimental', // Allow experimental features
-      '-i', rtspUrl,
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast', // Fastest encoding preset
-      '-tune', 'zerolatency', // Zero latency tuning
-      '-profile:v', 'baseline', // Baseline profile for faster decoding
-      '-level', '3.0', // H.264 level
-      '-g', '30', // Smaller GOP size for faster seeking (30 frames = ~1 second at 30fps)
-      '-keyint_min', '30', // Minimum keyframe interval
-      '-sc_threshold', '0', // Disable scene change detection for faster encoding
-      '-c:a', 'aac',
-      '-ar', '44100',
-      '-b:a', '96k', // Lower audio bitrate for faster encoding
-      '-ac', '2', // Stereo
-      '-hls_time', '2', // 2 second segments (balance between startup and stability)
-      '-hls_list_size', '150', // Keep last 150 segments (5 minutes: 150 segments * 2 seconds = 300 seconds)
-      '-hls_flags', 'delete_segments+omit_endlist+independent_segments', // Delete old segments, omit endlist, independent segments
-      '-hls_segment_type', 'mpegts', // MPEG-TS segments
-      '-hls_segment_filename', segmentPattern,
-      '-f', 'hls',
-      '-start_number', '0',
-      '-hls_allow_cache', '0', // Disable caching for live streams
-      playlistPath
-    ];
-
+    const ffmpegArgs = buildFfmpegArgs(rtspUrl, playlistPath, segmentPattern, profile);
     console.log(`Starting FFmpeg conversion for: ${rtspUrl}`);
+    console.log(`FFmpeg profile: ${profile.name}`);
     console.log(`FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
-    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
 
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
     let errorOutput = '';
     let hasStarted = false;
 
@@ -98,24 +252,21 @@ function convertRTSPtoHLS(rtspUrl, streamId) {
     ffmpeg.stderr.on('data', (data) => {
       const output = data.toString();
       errorOutput += output;
-      
-      // Log ALL FFmpeg output for debugging (first 20 lines to avoid spam)
+
       const lines = output.split('\n').filter(l => l.trim());
       lines.forEach((line, idx) => {
-        if (idx < 20) { // Limit initial logging
+        if (idx < 20) {
           console.log(`FFmpeg [${streamId}]: ${line.trim()}`);
         }
       });
-      
-      // Check for successful connection
+
       if (output.includes('Stream #') || output.includes('Output #') || output.includes('frame=') || output.includes('Duration: N/A') || output.includes('start:')) {
         if (!hasStarted) {
           hasStarted = true;
           console.log(`✅ FFmpeg [${streamId}]: Stream connection established`);
         }
       }
-      
-      // Log errors - be more verbose
+
       if (output.toLowerCase().includes('error') || 
           output.includes('Connection refused') || 
           output.includes('Connection timed out') ||
@@ -126,35 +277,29 @@ function convertRTSPtoHLS(rtspUrl, streamId) {
           output.includes('No route to host')) {
         console.error(`❌ FFmpeg ERROR [${streamId}]:`, output.trim());
       }
-      
-      // Log important messages
+
       if (output.includes('Stream #') || output.includes('Output #') || output.includes('Duration:') || output.includes('frame=') || output.includes('Opening')) {
         console.log(`ℹ️ FFmpeg [${streamId}]:`, output.trim());
       }
-      
-      // Log when first segment is created and update tracking
+
       if (output.includes('Opening') && output.includes('.ts')) {
         console.log(`✅ FFmpeg [${streamId}]: Creating segment file`);
-        // Update segment tracking
         const streamInfo = activeStreams.get(streamId);
         if (streamInfo) {
           streamInfo.lastSegmentTime = Date.now();
-          // Try to count segments
           try {
             const segmentFiles = fs.readdirSync(streamInfo.outputPath)
               .filter(f => f.endsWith('.ts'));
             streamInfo.lastSegmentCount = segmentFiles.length;
-          } catch (err) {
-            // Ignore errors counting segments
+          } catch {
+            // ignore
           }
         }
       }
-      
-      // Also track when frames are being processed (indicates stream is active)
+
       if (output.includes('frame=') && output.includes('fps=')) {
         const streamInfo = activeStreams.get(streamId);
         if (streamInfo) {
-          // Update last activity time (use current time as proxy for segment generation)
           streamInfo.lastSegmentTime = Date.now();
         }
       }
@@ -166,19 +311,13 @@ function convertRTSPtoHLS(rtspUrl, streamId) {
         console.error(`RTSP URL: ${rtspUrl}`);
         console.error(`FFmpeg error output (last 2000 chars):\n${errorOutput.substring(Math.max(0, errorOutput.length - 2000))}`);
         activeStreams.delete(streamId);
-        
-        // Provide more helpful error message
+
         let errorMessage = `FFmpeg conversion failed with code ${code}`;
-        if (errorOutput.includes('Connection refused')) {
-          errorMessage += ': Connection refused - Check if RTSP server is running and accessible';
-        } else if (errorOutput.includes('Connection timed out')) {
-          errorMessage += ': Connection timed out - Check network connectivity and RTSP URL';
-        } else if (errorOutput.includes('401') || errorOutput.includes('Unauthorized')) {
-          errorMessage += ': Authentication failed - Check RTSP credentials';
-        } else if (errorOutput.includes('404')) {
-          errorMessage += ': Stream not found - Check RTSP URL path';
+        const classified = classifyFfmpegError(errorOutput);
+        if (classified) {
+          errorMessage += ` (${classified})`;
         }
-        
+
         reject(new Error(`${errorMessage}. Output: ${errorOutput.substring(0, 500)}`));
       } else {
         console.log(`FFmpeg process exited normally (code ${code}) for stream: ${streamId}`);
@@ -191,7 +330,6 @@ function convertRTSPtoHLS(rtspUrl, streamId) {
       reject(error);
     });
 
-    // Wait a bit to see if FFmpeg starts successfully and connects
     setTimeout(() => {
       if (ffmpeg.killed) {
         console.error(`❌ FFmpeg process was killed before starting for: ${streamId}`);
@@ -199,19 +337,19 @@ function convertRTSPtoHLS(rtspUrl, streamId) {
         activeStreams.delete(streamId);
         reject(new Error(`FFmpeg process was killed. Error: ${errorOutput.substring(0, 500)}`));
       } else if (hasStarted) {
-          activeStreams.set(streamId, { 
-            process: ffmpeg, 
-            rtspUrl, 
-            outputPath,
-            lastSegmentTime: Date.now(), // Track when last segment was created
-            lastSegmentCount: 0, // Track segment count
-            restartCount: 0 // Track how many times we've restarted
-          });
-          console.log(`✅ FFmpeg conversion started successfully for: ${streamId}`);
-          resolve();
+        activeStreams.set(streamId, { 
+          process: ffmpeg, 
+          rtspUrl, 
+          outputPath,
+          lastSegmentTime: Date.now(),
+          lastSegmentCount: 0,
+          restartCount: 0,
+          profileName: profile.name,
+          lastRequestTime: Date.now()
+        });
+        console.log(`✅ FFmpeg conversion started successfully for: ${streamId} (profile ${profile.name})`);
+        resolve();
       } else {
-        // Still waiting, but accept it anyway (might be slow connection)
-        // Check if there are any critical errors
         const hasCriticalError = errorOutput.includes('Connection refused') || 
             errorOutput.includes('Connection timed out') || 
             errorOutput.includes('Unable to') ||
@@ -222,7 +360,7 @@ function convertRTSPtoHLS(rtspUrl, streamId) {
             errorOutput.includes('Server returned') ||
             errorOutput.toLowerCase().includes('authentication') ||
             errorOutput.toLowerCase().includes('unauthorized');
-            
+
         if (hasCriticalError) {
           console.error(`❌ FFmpeg connection failed for: ${streamId}`);
           console.error(`RTSP URL: ${rtspUrl}`);
@@ -231,7 +369,6 @@ function convertRTSPtoHLS(rtspUrl, streamId) {
           activeStreams.delete(streamId);
           reject(new Error(`FFmpeg connection failed: ${errorOutput.substring(0, 500)}`));
         } else {
-          // Check if we have any output at all (might be silent failure)
           if (errorOutput.length === 0) {
             console.log(`⏳ FFmpeg still initializing for: ${streamId} (no output yet, might be connecting)...`);
           } else {
@@ -244,12 +381,14 @@ function convertRTSPtoHLS(rtspUrl, streamId) {
             outputPath,
             lastSegmentTime: Date.now(),
             lastSegmentCount: 0,
-            restartCount: 0
+            restartCount: 0,
+            profileName: profile.name,
+            lastRequestTime: Date.now()
           });
           resolve();
         }
       }
-    }, 10000); // Increased to 10 seconds to allow more time for RTSP connection
+    }, 10000);
   });
 }
 
@@ -269,13 +408,31 @@ function performHealthCheck() {
   const MAX_RESTARTS = 5; // Maximum number of restarts per stream
   
   activeStreams.forEach(async (streamInfo, streamId) => {
-    const { process, rtspUrl, outputPath, lastSegmentTime, lastSegmentCount, restartCount } = streamInfo;
+    const { process, rtspUrl, outputPath, lastSegmentTime, lastSegmentCount, restartCount, lastRequestTime, profileName } = streamInfo;
     
     // Check if process is still running
     if (!process || process.killed) {
       console.log(`⚠️ FFmpeg process ${streamId} is not running, removing from active streams`);
       activeStreams.delete(streamId);
       return;
+    }
+
+    const lastActivityTime = lastRequestTime || lastSegmentTime;
+    if (STREAM_IDLE_TIMEOUT_MS > 0 && lastActivityTime) {
+      const idleDuration = now - lastActivityTime;
+      if (idleDuration > STREAM_IDLE_TIMEOUT_MS) {
+        console.log(`🛑 Stream ${streamId} (profile ${profileName || 'unknown'}) idle for ${Math.round(idleDuration / 1000)}s. Stopping conversion.`);
+        try {
+          if (process && !process.killed) {
+            process.kill();
+          }
+        } catch (err) {
+          console.error(`Error stopping idle stream ${streamId}:`, err.message);
+        }
+        activeStreams.delete(streamId);
+        cleanupStreamArtifacts(streamId);
+        return;
+      }
     }
     
     // Check if segments are still being generated
@@ -322,12 +479,7 @@ function performHealthCheck() {
           activeStreams.delete(streamId);
           
           // Clean up old output directory
-          try {
-            fs.rmSync(outputPath, { recursive: true, force: true });
-            console.log(`Cleaned up output directory: ${outputPath}`);
-          } catch (err) {
-            console.error(`Error cleaning up output directory: ${err}`);
-          }
+          cleanupStreamArtifacts(streamId);
           
           // Restart FFmpeg
           try {
@@ -365,11 +517,7 @@ function performHealthCheck() {
           activeStreams.delete(streamId);
           
           // Clean up and restart
-          try {
-            fs.rmSync(outputPath, { recursive: true, force: true });
-          } catch (err) {
-            console.error(`Error cleaning up output directory: ${err}`);
-          }
+          cleanupStreamArtifacts(streamId);
           
           try {
             streamInfo.restartCount = restartCount + 1;
@@ -395,11 +543,7 @@ function performHealthCheck() {
         }
         activeStreams.delete(streamId);
         
-        try {
-          fs.rmSync(outputPath, { recursive: true, force: true });
-        } catch (err) {
-          // Ignore cleanup errors
-        }
+        cleanupStreamArtifacts(streamId);
         
         try {
           streamInfo.restartCount = restartCount + 1;
@@ -689,6 +833,7 @@ const server = http.createServer(async (req, res) => {
     const streamId = getStreamId(rtspUrl);
     console.log(`🆔 Stream ID for ${rtspUrl}: ${streamId}`);
     const playlistPath = path.join(HLS_OUTPUT_DIR, streamId, 'playlist.m3u8');
+    touchStreamAccess(streamId);
 
     // Check if stream is already being converted
     const existingStream = activeStreams.get(streamId);
@@ -708,15 +853,7 @@ const server = http.createServer(async (req, res) => {
         activeStreams.delete(streamId);
         
         // Clean up old output directory
-        const oldOutputPath = path.join(HLS_OUTPUT_DIR, streamId);
-        if (fs.existsSync(oldOutputPath)) {
-          try {
-            fs.rmSync(oldOutputPath, { recursive: true, force: true });
-            console.log(`Cleaned up old output directory: ${oldOutputPath}`);
-          } catch (err) {
-            console.error(`Error cleaning up output directory: ${err}`);
-          }
-        }
+        cleanupStreamArtifacts(streamId);
       } else {
         // Same RTSP URL, check if FFmpeg process is still running and healthy
         const isRunning = existingStream.process && !existingStream.process.killed;
@@ -724,15 +861,7 @@ const server = http.createServer(async (req, res) => {
           console.log(`FFmpeg process for ${streamId} is not running, restarting...`);
           activeStreams.delete(streamId);
           // Clean up old output directory
-          const oldOutputPath = path.join(HLS_OUTPUT_DIR, streamId);
-          if (fs.existsSync(oldOutputPath)) {
-            try {
-              fs.rmSync(oldOutputPath, { recursive: true, force: true });
-              console.log(`Cleaned up old output directory: ${oldOutputPath}`);
-            } catch (err) {
-              console.error(`Error cleaning up output directory: ${err}`);
-            }
-          }
+          cleanupStreamArtifacts(streamId);
         } else {
           // Check if segments are being created (not empty)
           const segmentPath = path.join(existingStream.outputPath, 'segment_000.ts');
@@ -743,12 +872,7 @@ const server = http.createServer(async (req, res) => {
               existingStream.process.kill();
               activeStreams.delete(streamId);
               // Clean up old output directory
-              try {
-                fs.rmSync(existingStream.outputPath, { recursive: true, force: true });
-                console.log(`Cleaned up empty output directory: ${existingStream.outputPath}`);
-              } catch (err) {
-                console.error(`Error cleaning up output directory: ${err}`);
-              }
+              cleanupStreamArtifacts(streamId);
             } else {
               console.log(`✅ Stream ${streamId} is already active with valid segments (${stats.size} bytes) for ${rtspUrl}`);
             }

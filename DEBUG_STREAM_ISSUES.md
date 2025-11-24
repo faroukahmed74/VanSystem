@@ -16,6 +16,25 @@ This will:
 
 ## Common Issues and Solutions
 
+### ✅ New Server-Side Protections (Nov 2025)
+
+- **Automatic FFmpeg profile fallback**  
+  The converter now tries three pipelines in order:  
+  1. `copy-tcp` – copies the camera's H.264 bitstream (no re-encode, lowest CPU).  
+  2. `transcode-tcp` – re-encodes when the raw bitstream is malformed.  
+  3. `transcode-udp` – switches the transport layer when the camera rejects TCP/keeps dropping connections.  
+  You will see log lines such as `🎬 Attempting FFmpeg profile "copy-tcp"` followed by the one that succeeds.
+
+- **Idle-stream auto cleanup**  
+  Streams with no playlist/segment requests for 2 minutes are stopped automatically. This prevents abandoned FFmpeg processes when you switch buttons. Override via `FFMPEG_IDLE_TIMEOUT_MS`.
+
+- **Better diagnostics**  
+  When FFmpeg exits you now get a human-readable classification (`Camera returned 5XX`, `Connection reset by peer (-10054)`, etc.) based on the stderr log, making it easier to match what you saw in VLC vs. Node.
+
+- **Environment toggles**
+  - `FFMPEG_PROFILE=transcode-tcp` (or any profile name) forces a specific pipeline.
+  - `FFMPEG_HANDSHAKE_TIMEOUT`, `FFMPEG_RW_TIMEOUT`, `FFMPEG_ANALYZE_DURATION`, `FFMPEG_PROBE_SIZE` let you tune stubborn cameras without editing code.
+
 ### 1. Stream Works in VLC but Not in Web App
 
 **Possible Causes:**

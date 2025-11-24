@@ -41,6 +41,12 @@ function PreviewScreen() {
             // Clean up old stream first
             if (hlsRef.current) {
               console.log('Destroying old HLS instance')
+              if (hlsRef.current.fragmentStallTimer) {
+                clearTimeout(hlsRef.current.fragmentStallTimer)
+              }
+              if (hlsRef.current.releaseAutoLevelTimeout) {
+                clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
+              }
               hlsRef.current.destroy()
               hlsRef.current = null
             }
@@ -107,6 +113,12 @@ function PreviewScreen() {
           // Clean up old stream first
           if (hlsRef.current) {
             console.log('Destroying old HLS instance on reconnection')
+            if (hlsRef.current.fragmentStallTimer) {
+              clearTimeout(hlsRef.current.fragmentStallTimer)
+            }
+            if (hlsRef.current.releaseAutoLevelTimeout) {
+              clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
+            }
             hlsRef.current.destroy()
             hlsRef.current = null
           }
@@ -246,6 +258,9 @@ function PreviewScreen() {
       if (hlsRef.current.fragmentStallTimer) {
         clearTimeout(hlsRef.current.fragmentStallTimer)
       }
+      if (hlsRef.current.releaseAutoLevelTimeout) {
+        clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
+      }
       hlsRef.current.destroy()
       hlsRef.current = null
     }
@@ -258,25 +273,26 @@ function PreviewScreen() {
       console.log('Using HLS.js for HLS stream')
       const hls = new Hls({
         enableWorker: true,
-        lowLatencyMode: false, // Disable low latency for larger buffer
-        backBufferLength: 300, // 5 minutes of back buffer (300 seconds)
-        maxBufferLength: 300, // 5 minutes buffer (300 seconds)
-        maxMaxBufferLength: 300, // 5 minutes max buffer
-        maxBufferSize: 100 * 1000 * 1000, // 100MB buffer for 5 minutes of content
-        maxBufferHole: 0.5, // Allow small gaps
-        highBufferWatchdogPeriod: 2, // Check buffer every 2 seconds
-        nudgeOffset: 0.1,
+        lowLatencyMode: false,
+        backBufferLength: 120,
+        maxBufferLength: 45,
+        maxMaxBufferLength: 90,
+        maxBufferSize: 60 * 1000 * 1000,
+        maxBufferHole: 0.4,
+        highBufferWatchdogPeriod: 2,
+        nudgeOffset: 0.05,
         nudgeMaxRetry: 3,
-        maxFragLoadingTimeOut: 20000, // 20 second timeout
+        maxFragLoadingTimeOut: 20000,
         fragLoadingTimeOut: 20000,
-        manifestLoadingTimeOut: 10000, // 10 second timeout for manifest
+        manifestLoadingTimeOut: 10000,
         levelLoadingTimeOut: 10000,
-        startLevel: -1, // Auto-select best level
-        capLevelToPlayerSize: true, // Cap level to player size
-        autoStartLoad: true, // Start loading immediately
-        startPosition: -1, // Start from live edge
-        liveSyncDurationCount: 3, // Sync to live edge
-        liveMaxLatencyDurationCount: 10 // Allow more latency for stability
+        startLevel: 0,
+        capLevelToPlayerSize: true,
+        capLevelOnFPSDrop: true,
+        autoStartLoad: true,
+        startPosition: -1,
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 6
       })
       
       hlsRef.current = hls
@@ -286,6 +302,19 @@ function PreviewScreen() {
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         console.log('HLS manifest parsed, starting playback')
         console.log('HLS levels available:', hls.levels?.length || 0)
+        if (hls.levels && hls.levels.length > 0) {
+          const lowestLevelIndex = 0
+          hls.currentLevel = lowestLevelIndex
+          hls.loadLevel = lowestLevelIndex
+          hls.autoLevelCapping = lowestLevelIndex
+          hls.nextAutoLevel = lowestLevelIndex
+        }
+        hls.releaseAutoLevelTimeout = setTimeout(() => {
+          if (hlsRef.current === hls) {
+            hls.autoLevelCapping = -1
+            hls.nextAutoLevel = -1
+          }
+        }, 15000)
         // Start playback immediately without waiting
         video.play().catch(err => {
           console.error('Error playing HLS video:', err)
@@ -555,6 +584,12 @@ function PreviewScreen() {
     // Clean up old HLS instance before loading new stream
     if (hlsRef.current) {
       console.log('🧹 Cleaning up old HLS instance before loading new stream')
+      if (hlsRef.current.fragmentStallTimer) {
+        clearTimeout(hlsRef.current.fragmentStallTimer)
+      }
+      if (hlsRef.current.releaseAutoLevelTimeout) {
+        clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
+      }
       hlsRef.current.destroy()
       hlsRef.current = null
     }
@@ -581,6 +616,12 @@ function PreviewScreen() {
       }
       // Clean up HLS instance
       if (hlsRef.current) {
+        if (hlsRef.current.fragmentStallTimer) {
+          clearTimeout(hlsRef.current.fragmentStallTimer)
+        }
+        if (hlsRef.current.releaseAutoLevelTimeout) {
+          clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
+        }
         hlsRef.current.destroy()
         hlsRef.current = null
       }

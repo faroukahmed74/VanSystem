@@ -4,16 +4,16 @@
   "description": "Video stream preview and editor application",
   "private": true,
   "dependencies": {
+    "hls.js": "^1.4.12",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.20.0",
-    "ws": "^8.14.2",
-    "hls.js": "^1.4.12"
+    "ws": "^8.14.2"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.1",
-    "vite": "^5.1.0",
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "vite": "^5.1.0"
   },
   "scripts": {
     "dev": "concurrently \"npm run ws\" \"npm run converter\" \"npm run vite\"",
@@ -25,4 +25,3 @@
     "preview": "vite preview"
   }
 }
-
