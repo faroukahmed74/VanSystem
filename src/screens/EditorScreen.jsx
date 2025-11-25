@@ -1,4 +1,4 @@
-import React, { useState, useContext, useEffect, useRef } from 'react'
+import React, { useState, useContext, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { StreamContext } from '../context/StreamContext'
 import { createWebSocketConnection, sendWebSocketMessage, reconnectWebSocket } from '../utils/websocket'
@@ -6,6 +6,10 @@ import { validateInput } from '../utils/validation'
 import { loadSavedButtons, saveButtons } from '../utils/storage'
 import Notification from '../components/Notification'
 import './EditorScreen.css'
+
+const DEFAULT_PANEL_WIDTH = 420
+const MIN_PANEL_WIDTH = 360
+const MAX_PANEL_WIDTH = 640
 
 function EditorScreen() {
   const navigate = useNavigate()
@@ -17,10 +21,29 @@ function EditorScreen() {
   const reconnectRef = useRef(null)
   const [wsConnected, setWsConnected] = useState(false)
   const [notification, setNotification] = useState(null)
-  const [buttonStatus, setButtonStatus] = useState({}) // Track connection status: { buttonId: 'connected' | 'disconnected' | 'checking' }
+  const [buttonStatus, setButtonStatus] = useState({}) // Track connection status: { buttonId: 'connected' | 'disconnected' }
   const [editingButton, setEditingButton] = useState(null) // Track which button is being edited: { id, name, url, ip }
   const [editIp, setEditIp] = useState('')
   const [editName, setEditName] = useState('')
+  const [panelWidth, setPanelWidth] = useState(() => {
+    const stored = localStorage.getItem('editor-panel-width')
+    return stored ? Math.min(MAX_PANEL_WIDTH, Math.max(MIN_PANEL_WIDTH, parseInt(stored, 10))) : DEFAULT_PANEL_WIDTH
+  })
+  const resizeStateRef = useRef(null)
+  const panelWidthRef = useRef(panelWidth)
+
+  const getStreamLabel = useCallback((button) => {
+    if (!button) return ''
+    if (button.ip) return button.ip
+    if (!button.url) return ''
+    const withoutProtocol = button.url.replace(/^rtsp:\/\//i, '')
+    const hostPart = withoutProtocol.split('/')[0] || ''
+    return hostPart.split(':')[0] || hostPart
+  }, [])
+
+  useEffect(() => {
+    panelWidthRef.current = panelWidth
+  }, [panelWidth])
 
   // Check if IP is reachable (ping equivalent using TCP connection)
   const checkStreamConnection = async (rtspUrl) => {
@@ -72,12 +95,6 @@ function EditorScreen() {
     
     const statusUpdates = {}
     
-    // Set all to checking first (immediate visual feedback)
-    savedButtons.forEach(button => {
-      statusUpdates[button.id] = 'checking'
-    })
-    setButtonStatus(prev => ({ ...prev, ...statusUpdates }))
-    
     // Check each button sequentially to avoid overwhelming the server
     for (const button of savedButtons) {
       try {
@@ -104,10 +121,10 @@ function EditorScreen() {
     if (loaded && loaded.length > 0) {
       console.log('Loaded buttons from localStorage:', loaded)
       setSavedButtons(loaded)
-      // Initialize all buttons with "checking" status
+      // Initialize all buttons as disconnected until a check runs
       const initialStatus = {}
       loaded.forEach(button => {
-        initialStatus[button.id] = 'checking'
+        initialStatus[button.id] = 'disconnected'
       })
       setButtonStatus(initialStatus)
       // Also try to sync with server if connected
@@ -180,6 +197,7 @@ function EditorScreen() {
     // Update local state immediately
     const updatedButtons = [...savedButtons, newButton]
     setSavedButtons(updatedButtons)
+    setButtonStatus(prev => ({ ...prev, [newButton.id]: 'disconnected' }))
     setIp('')
     setDirectorateName('')
     
@@ -367,6 +385,10 @@ function EditorScreen() {
     showNotification('Opening Preview Screen in new tab...', 'info')
   }
 
+  const handleNavigateToUserScreen = () => {
+    navigate('/user')
+  }
+
   const handleEditButton = (button, e) => {
     e.stopPropagation()
     setEditingButton(button)
@@ -395,6 +417,7 @@ function EditorScreen() {
     )
     
     setSavedButtons(updatedButtons)
+    setButtonStatus(prev => ({ ...prev, [editingButton.id]: 'disconnected' }))
     saveButtons(updatedButtons)
     
     // Broadcast update to all Editor Screens
@@ -451,6 +474,46 @@ function EditorScreen() {
     }
   }
 
+  const startPanelResize = (event) => {
+    const clientX = event.type === 'touchstart' ? event.touches[0].clientX : event.clientX
+    resizeStateRef.current = { startX: clientX, startWidth: panelWidth }
+    document.addEventListener('mousemove', handlePanelResize)
+    document.addEventListener('mouseup', stopPanelResize)
+    document.addEventListener('touchmove', handlePanelResize, { passive: false })
+    document.addEventListener('touchend', stopPanelResize)
+  }
+
+  const handlePanelResize = (event) => {
+    if (!resizeStateRef.current) return
+    event.preventDefault()
+    const clientX = event.type === 'touchmove' ? event.touches[0].clientX : event.clientX
+    const delta = clientX - resizeStateRef.current.startX
+    const nextWidth = Math.min(
+      MAX_PANEL_WIDTH,
+      Math.max(MIN_PANEL_WIDTH, resizeStateRef.current.startWidth + delta)
+    )
+    setPanelWidth(nextWidth)
+  }
+
+  const stopPanelResize = () => {
+    if (!resizeStateRef.current) return
+    localStorage.setItem('editor-panel-width', String(Math.round(panelWidthRef.current)))
+    resizeStateRef.current = null
+    document.removeEventListener('mousemove', handlePanelResize)
+    document.removeEventListener('mouseup', stopPanelResize)
+    document.removeEventListener('touchmove', handlePanelResize)
+    document.removeEventListener('touchend', stopPanelResize)
+  }
+
+  useEffect(() => {
+    return () => {
+      document.removeEventListener('mousemove', handlePanelResize)
+      document.removeEventListener('mouseup', stopPanelResize)
+      document.removeEventListener('touchmove', handlePanelResize)
+      document.removeEventListener('touchend', stopPanelResize)
+    }
+  }, [])
+
   return (
     <div className="editor-screen">
       {notification && (
@@ -460,14 +523,146 @@ function EditorScreen() {
           onClose={() => setNotification(null)}
         />
       )}
+      <div
+        className="editor-layout"
+        style={{ gridTemplateColumns: `${Math.round(panelWidth)}px minmax(0, 1fr)` }}
+      >
+        <div
+          className="editor-panel-wrapper"
+          style={{ width: `${panelWidth}px`, minWidth: `${MIN_PANEL_WIDTH}px` }}
+        >
+          <aside className="editor-left-panel">
+            <div className="editor-panel-header">
+              <div>
+                <h2>Saved Streams</h2>
+                <p>Click a button to send it to the preview screen</p>
+              </div>
+              <span className={`connection-status ${wsConnected ? 'connected' : 'disconnected'}`}>
+                <span className="status-dot"></span>
+                {wsConnected ? 'Connected' : 'Disconnected'}
+              </span>
+            </div>
+            <div className="editor-panel-buttons">
+              {savedButtons.length === 0 ? (
+                <p className="editor-empty">No buttons saved yet. Create one on the right.</p>
+              ) : (
+                savedButtons.map((button) => {
+                  const status = buttonStatus[button.id] || 'disconnected'
+                  const isEditing = editingButton && editingButton.id === button.id
+                  const streamLabel = getStreamLabel(button)
+                  return (
+                    <div
+                      key={button.id}
+                      className={`editor-panel-button status-${status} ${isEditing ? 'editing' : ''}`}
+                    >
+                      {isEditing ? (
+                        <div className="editor-panel-edit-form">
+                          <div className="editor-panel-input">
+                            <label htmlFor={`edit-ip-${button.id}`}>IP Address</label>
+                            <input
+                              id={`edit-ip-${button.id}`}
+                              type="text"
+                              value={editIp}
+                              onChange={(e) => setEditIp(e.target.value)}
+                              className="input-field"
+                              placeholder="Enter IP address"
+                            />
+                          </div>
+                          <div className="editor-panel-input">
+                            <label htmlFor={`edit-name-${button.id}`}>اسم المديرية (Directorate Name)</label>
+                            <input
+                              id={`edit-name-${button.id}`}
+                              type="text"
+                              value={editName}
+                              onChange={(e) => setEditName(e.target.value)}
+                              className="input-field"
+                              placeholder="Enter Directorate name"
+                            />
+                          </div>
+                          <div className="edit-actions">
+                            <button onClick={handleSaveEdit} className="save-edit-button">
+                              Save
+                            </button>
+                            <button onClick={handleCancelEdit} className="cancel-edit-button">
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <div
+                            className="editor-panel-button-content"
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => handleButtonClick(button)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault()
+                                handleButtonClick(button)
+                              }
+                            }}
+                          >
+                            <div className="editor-panel-button-header">
+                              <div className="editor-panel-name-group">
+                                <span className="editor-panel-name">{button.name}</span>
+                                {streamLabel && (
+                                  <span className="editor-panel-ip">{streamLabel}</span>
+                                )}
+                              </div>
+                              <div className="editor-panel-status">
+                                <span className={`status-dot status-dot-${status}`}></span>
+                                <span className="status-text">
+                                  {status === 'connected' ? 'Connected' : 'Disconnected'}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                          <div className="editor-panel-button-actions">
+                            <button
+                              className="icon-button"
+                              onClick={(e) => handleEditButton(button, e)}
+                              title="Edit IP and name"
+                            >
+                              ✏️
+                            </button>
+                            <button
+                              className="icon-button danger"
+                              onClick={(e) => handleDeleteButton(button.id, e)}
+                              title="Delete button"
+                            >
+                              ×
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )
+                })
+              )}
+            </div>
+          </aside>
+          <div
+            className="editor-panel-resize-handle"
+            onMouseDown={startPanelResize}
+            onTouchStart={startPanelResize}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize saved streams panel"
+          />
+        </div>
+
+        <main className="editor-main">
       <div className="editor-container">
         <div className="header-section">
           <h1 className="editor-title">Editor Screen</h1>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '20px', flexWrap: 'wrap' }}>
-            <div className={`connection-status ${wsConnected ? 'connected' : 'disconnected'}`}>
-              <span className="status-dot"></span>
-              {wsConnected ? 'Connected' : 'Disconnected'}
-            </div>
+          <div className="header-buttons">
+            <button 
+              onClick={handleNavigateToUserScreen}
+              className="preview-button"
+              title="Navigate to User Screen"
+            >
+              👥 Go to User Screen
+            </button>
             <button 
               onClick={handleOpenPreviewInNewTab}
               className="preview-button"
@@ -508,94 +703,11 @@ function EditorScreen() {
           </button>
         </div>
 
-        <div className="buttons-section">
-          <h2 className="section-title">Saved Buttons</h2>
-          <div className="buttons-grid">
-            {savedButtons.length === 0 ? (
-              <p className="empty-message">No buttons saved yet. Create one above.</p>
-            ) : (
-              savedButtons.map((button) => {
-                const status = buttonStatus[button.id] || 'checking'
-                const statusClass = `saved-button status-${status}`
-                const isEditing = editingButton && editingButton.id === button.id
-                
-                if (isEditing) {
-                  return (
-                    <div key={button.id} className="saved-button editing">
-                      <div className="edit-form">
-                        <div className="input-group">
-                          <label>IP Address</label>
-                          <input
-                            type="text"
-                            value={editIp}
-                            onChange={(e) => setEditIp(e.target.value)}
-                            className="input-field"
-                            placeholder="Enter IP address"
-                          />
-                        </div>
-                        <div className="input-group">
-                          <label>اسم المديرية (Directorate Name)</label>
-                          <input
-                            type="text"
-                            value={editName}
-                            onChange={(e) => setEditName(e.target.value)}
-                            className="input-field"
-                            placeholder="Enter Directorate name"
-                          />
-                        </div>
-                        <div className="edit-actions">
-                          <button onClick={handleSaveEdit} className="save-edit-button">
-                            Save
-                          </button>
-                          <button onClick={handleCancelEdit} className="cancel-edit-button">
-                            Cancel
-                          </button>
+            <div className="editor-help-card">
+              <p>Saved buttons now live in the left panel. Select any entry to broadcast it instantly, or use the ✏️ / × icons to edit or delete.</p>
                         </div>
                       </div>
-                    </div>
-                  )
-                }
-                
-                return (
-                  <div
-                    key={button.id}
-                    className={statusClass}
-                    onClick={() => handleButtonClick(button)}
-                  >
-                    <div className="button-content">
-                      <span className="button-name">{button.name}</span>
-                      <span className="button-url">{button.url}</span>
-                      <span className="button-status-indicator">
-                        <span className={`status-dot status-dot-${status}`}></span>
-                        <span className="status-text">
-                          {status === 'connected' && 'Connected'}
-                          {status === 'disconnected' && 'Disconnected'}
-                          {status === 'checking' && 'Checking...'}
-                        </span>
-                      </span>
-                    </div>
-                    <div className="button-actions">
-                      <button
-                        className="edit-button"
-                        onClick={(e) => handleEditButton(button, e)}
-                        title="Edit IP and Name"
-                      >
-                        ✏️
-                      </button>
-                      <button
-                        className="delete-button"
-                        onClick={(e) => handleDeleteButton(button.id, e)}
-                        title="Delete"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  </div>
-                )
-              })
-            )}
-          </div>
-        </div>
+        </main>
       </div>
     </div>
   )

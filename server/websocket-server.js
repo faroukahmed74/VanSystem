@@ -19,6 +19,7 @@ const clients = new Set();
 
 // Load buttons from persistent storage
 let sharedButtons = loadButtons();
+let lastStreamState = null;
 console.log(`Server started with ${sharedButtons.length} saved buttons`);
 
 wss.on('connection', (ws, req) => {
@@ -31,7 +32,8 @@ wss.on('connection', (ws, req) => {
     ws.send(JSON.stringify({ 
       type: 'connected', 
       message: 'Connected to server',
-      buttons: sharedButtons
+      buttons: sharedButtons,
+      currentStream: lastStreamState
     }));
     console.log(`Sent ${sharedButtons.length} buttons to new client`);
   } catch (error) {
@@ -166,6 +168,11 @@ wss.on('connection', (ws, req) => {
         // Broadcast stream updates to ALL clients (including sender)
         // This ensures Preview Screens on the same machine and network get updates
         console.log('Broadcasting stream update:', data.streamUrl);
+        lastStreamState = {
+          streamUrl: data.streamUrl,
+          overlayText: data.overlayText,
+          timestamp: Date.now()
+        };
         const streamMessage = JSON.stringify(data);
         
         let sentCount = 0;
@@ -180,6 +187,19 @@ wss.on('connection', (ws, req) => {
           }
         });
         console.log(`Broadcasted stream update to ${sentCount} clients`);
+      } else if (data.type === 'requestCurrentStream') {
+        if (lastStreamState) {
+          try {
+            ws.send(JSON.stringify({
+              type: 'currentStream',
+              ...lastStreamState
+            }));
+          } catch (error) {
+            console.error('Error sending current stream to client:', error);
+          }
+        } else {
+          console.log('Client requested current stream but none is available yet');
+        }
       } else {
         // Broadcast other messages to all other clients only
         clients.forEach((client) => {

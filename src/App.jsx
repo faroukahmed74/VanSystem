@@ -16,6 +16,7 @@ function App() {
           <Route path="/editor" element={<EditorScreen />} />
           <Route path="/preview" element={<PreviewScreen />} />
           <Route path="/user" element={<UserScreen />} />
+          <Route path="/users" element={<Navigate to="/user" replace />} />
           <Route path="/" element={<Navigate to="/editor" replace />} />
         </Routes>
       </Router>
