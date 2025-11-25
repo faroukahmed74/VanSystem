@@ -1,7 +1,7 @@
-import React, { useContext, useEffect, useRef, useState } from 'react'
+import React, { useContext, useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { StreamContext } from '../context/StreamContext'
-import { createWebSocketConnection, reconnectWebSocket } from '../utils/websocket'
+import { createWebSocketConnection, reconnectWebSocket, sendWebSocketMessage } from '../utils/websocket'
 import { detectStreamType, getPlayableUrl } from '../utils/streamConverter'
 import Hls from 'hls.js'
 import './PreviewScreen.css'
@@ -21,79 +21,96 @@ function PreviewScreen() {
   const retryTimeoutRef = useRef(null)
   const retryCountRef = useRef(0)
   const maxRetries = Infinity // Keep retrying indefinitely until IP changes
-  const retryDelay = 1500 // 1.5 seconds (faster retry)
+  const retryDelay = 800 // tighter retry loop for low-latency playback
   const hlsRef = useRef(null)
   const lastFrameRef = useRef(null) // Cache for last frame
   const frameCaptureIntervalRef = useRef(null)
   const canvasRef = useRef(null) // Canvas for capturing frames
 
-  // Initialize WebSocket connection for real-time updates with reconnection
+  const cleanupStreamResources = useCallback(() => {
+    if (hlsRef.current) {
+      console.log('Destroying old HLS instance')
+      if (hlsRef.current.fragmentStallTimer) {
+        clearTimeout(hlsRef.current.fragmentStallTimer)
+      }
+      if (hlsRef.current.releaseAutoLevelTimeout) {
+        clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
+      }
+      if (hlsRef.current.latencyMonitorInterval) {
+        clearInterval(hlsRef.current.latencyMonitorInterval)
+      }
+      hlsRef.current.destroy()
+      hlsRef.current = null
+    }
+
+    if (videoRef.current) {
+      console.log('Resetting video element')
+      videoRef.current.pause()
+      videoRef.current.src = ''
+      videoRef.current.load()
+    }
+
+    if (frameCaptureIntervalRef.current) {
+      clearInterval(frameCaptureIntervalRef.current)
+      frameCaptureIntervalRef.current = null
+    }
+    lastFrameRef.current = null
+
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current)
+      retryTimeoutRef.current = null
+    }
+    retryCountRef.current = 0
+
+    setPlayableUrl(null)
+  }, [])
+
+  const applyStreamUpdate = useCallback((streamData, origin = 'server') => {
+    if (!streamData || !streamData.streamUrl) return
+
+    console.log(`Applying stream update (${origin})`, streamData.streamUrl)
+    cleanupStreamResources()
+
+    setCurrentStreamUrl(streamData.streamUrl)
+    setCurrentOverlayText(streamData.overlayText || '')
+    setStreamUrl(streamData.streamUrl)
+    setOverlayText(streamData.overlayText || '')
+    setIsLoading(true)
+    setHasError(false)
+  }, [cleanupStreamResources, setOverlayText, setStreamUrl])
+
+  const requestLatestStream = useCallback(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      sendWebSocketMessage(wsRef.current, 'requestCurrentStream', {})
+    }
+  }, [])
+
   useEffect(() => {
+    const handleMessage = (data, origin = 'server') => {
+      if (!data || !data.type) return
+
+      if (data.type === 'streamUpdate') {
+        applyStreamUpdate(data, origin)
+      } else if (data.type === 'connected') {
+        if (data.currentStream) {
+          applyStreamUpdate(data.currentStream, 'initial-state')
+        }
+      } else if (data.type === 'currentStream') {
+        applyStreamUpdate(data, 'current-state')
+      }
+    }
+
     const connect = () => {
       wsRef.current = createWebSocketConnection(
-        (data) => {
-          if (data.type === 'streamUpdate') {
-            // Update stream when receiving broadcast from Editor
-            console.log('Received stream update:', data)
-            console.log('Old stream URL:', currentStreamUrl)
-            console.log('New stream URL:', data.streamUrl)
-            
-            // Clean up old stream first
-            if (hlsRef.current) {
-              console.log('Destroying old HLS instance')
-              if (hlsRef.current.fragmentStallTimer) {
-                clearTimeout(hlsRef.current.fragmentStallTimer)
-              }
-              if (hlsRef.current.releaseAutoLevelTimeout) {
-                clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
-              }
-              hlsRef.current.destroy()
-              hlsRef.current = null
-            }
-            
-            if (videoRef.current) {
-              console.log('Clearing video element')
-              videoRef.current.pause()
-              videoRef.current.src = ''
-              videoRef.current.load()
-            }
-            
-            // Clear frame capture
-            if (frameCaptureIntervalRef.current) {
-              clearInterval(frameCaptureIntervalRef.current)
-              frameCaptureIntervalRef.current = null
-            }
-            lastFrameRef.current = null
-            
-            // Clear retry timeout
-            if (retryTimeoutRef.current) {
-              clearTimeout(retryTimeoutRef.current)
-              retryTimeoutRef.current = null
-            }
-            retryCountRef.current = 0
-            
-            // Reset playable URL to force recalculation
-            setPlayableUrl(null)
-            
-            // Update stream URL and overlay text
-            setCurrentStreamUrl(data.streamUrl)
-            setCurrentOverlayText(data.overlayText)
-            setStreamUrl(data.streamUrl)
-            setOverlayText(data.overlayText)
-            
-            // Force video reload
-            setIsLoading(true)
-            setHasError(false)
-          }
-        },
+        (data) => handleMessage(data, 'primary'),
         (error) => {
           console.error('WebSocket error:', error)
         },
         () => {
           console.log('Preview Screen WebSocket connected')
+          requestLatestStream()
         },
         (event) => {
-          // Only reconnect if not a normal closure
           if (event.code !== 1000 && reconnectRef.current) {
             reconnectRef.current.attempt()
           }
@@ -103,60 +120,14 @@ function PreviewScreen() {
 
     connect()
 
-    // Set up reconnection handler
     reconnectRef.current = reconnectWebSocket(
       wsRef,
-      (data) => {
-        if (data.type === 'streamUpdate') {
-          console.log('Reconnection: Received stream update:', data)
-          
-          // Clean up old stream first
-          if (hlsRef.current) {
-            console.log('Destroying old HLS instance on reconnection')
-            if (hlsRef.current.fragmentStallTimer) {
-              clearTimeout(hlsRef.current.fragmentStallTimer)
-            }
-            if (hlsRef.current.releaseAutoLevelTimeout) {
-              clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
-            }
-            hlsRef.current.destroy()
-            hlsRef.current = null
-          }
-          
-          if (videoRef.current) {
-            console.log('Clearing video element on reconnection')
-            videoRef.current.pause()
-            videoRef.current.src = ''
-            videoRef.current.load()
-          }
-          
-          // Clear frame capture
-          if (frameCaptureIntervalRef.current) {
-            clearInterval(frameCaptureIntervalRef.current)
-            frameCaptureIntervalRef.current = null
-          }
-          lastFrameRef.current = null
-          
-          // Clear retry timeout
-          if (retryTimeoutRef.current) {
-            clearTimeout(retryTimeoutRef.current)
-            retryTimeoutRef.current = null
-          }
-          retryCountRef.current = 0
-          
-          // Reset playable URL to force recalculation
-          setPlayableUrl(null)
-          
-          setCurrentStreamUrl(data.streamUrl)
-          setCurrentOverlayText(data.overlayText)
-          setStreamUrl(data.streamUrl)
-          setOverlayText(data.overlayText)
-          setIsLoading(true)
-          setHasError(false)
-        }
-      },
+      (data) => handleMessage(data, 'reconnect'),
       (error) => console.error('WebSocket error:', error),
-      () => console.log('Preview Screen WebSocket reconnected')
+      () => {
+        console.log('Preview Screen WebSocket reconnected')
+        requestLatestStream()
+      }
     )
 
     return () => {
@@ -167,7 +138,27 @@ function PreviewScreen() {
         wsRef.current.close(1000, 'Component unmounting')
       }
     }
-  }, [setStreamUrl, setOverlayText])
+  }, [applyStreamUpdate, requestLatestStream])
+
+  const ensureLiveEdge = useCallback(() => {
+    const video = videoRef.current
+    if (!video || video.readyState < 2 || !video.seekable || video.seekable.length === 0) {
+      return
+    }
+    try {
+      const liveEdge = video.seekable.end(video.seekable.length - 1)
+      const drift = liveEdge - video.currentTime
+      if (Number.isFinite(drift) && drift > 2.5) {
+        console.warn(`Viewer drifted ${drift.toFixed(2)}s behind live edge, fast-forwarding`)
+        const target = Math.max(video.seekable.start(video.seekable.length - 1), liveEdge - 0.3)
+        if (Number.isFinite(target)) {
+          video.currentTime = target
+        }
+      }
+    } catch (error) {
+      console.warn('Unable to evaluate live edge drift:', error)
+    }
+  }, [])
 
   // Capture last frame from video
   const captureLastFrame = React.useCallback(() => {
@@ -261,6 +252,9 @@ function PreviewScreen() {
       if (hlsRef.current.releaseAutoLevelTimeout) {
         clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
       }
+      if (hlsRef.current.latencyMonitorInterval) {
+        clearInterval(hlsRef.current.latencyMonitorInterval)
+      }
       hlsRef.current.destroy()
       hlsRef.current = null
     }
@@ -273,31 +267,52 @@ function PreviewScreen() {
       console.log('Using HLS.js for HLS stream')
       const hls = new Hls({
         enableWorker: true,
-        lowLatencyMode: false,
-        backBufferLength: 120,
-        maxBufferLength: 45,
-        maxMaxBufferLength: 90,
-        maxBufferSize: 60 * 1000 * 1000,
-        maxBufferHole: 0.4,
-        highBufferWatchdogPeriod: 2,
-        nudgeOffset: 0.05,
-        nudgeMaxRetry: 3,
-        maxFragLoadingTimeOut: 20000,
-        fragLoadingTimeOut: 20000,
-        manifestLoadingTimeOut: 10000,
-        levelLoadingTimeOut: 10000,
+        lowLatencyMode: true,
+        backBufferLength: 30,
+        maxBufferLength: 10,
+        maxMaxBufferLength: 20,
+        maxBufferSize: 25 * 1000 * 1000,
+        maxBufferHole: 0.2,
+        highBufferWatchdogPeriod: 1,
+        nudgeOffset: 0.03,
+        nudgeMaxRetry: 5,
+        maxFragLoadingTimeOut: 8000,
+        fragLoadingTimeOut: 8000,
+        manifestLoadingTimeOut: 5000,
+        levelLoadingTimeOut: 5000,
         startLevel: 0,
         capLevelToPlayerSize: true,
         capLevelOnFPSDrop: true,
         autoStartLoad: true,
         startPosition: -1,
-        liveSyncDurationCount: 3,
-        liveMaxLatencyDurationCount: 6
+        liveSyncDurationCount: 1,
+        liveMaxLatencyDurationCount: 3,
+        maxLiveSyncPlaybackRate: 1.5,
+        progressive: true,
+        enableSoftwareAES: false
       })
       
       hlsRef.current = hls
       hls.loadSource(playableUrl)
       hls.attachMedia(video)
+
+      if (hls.latencyMonitorInterval) {
+        clearInterval(hls.latencyMonitorInterval)
+      }
+      hls.latencyMonitorInterval = setInterval(() => {
+        ensureLiveEdge()
+        const currentLatency = typeof hls.latency === 'number' ? hls.latency : null
+        if (currentLatency && currentLatency > 2.5) {
+          console.warn(`Detected ${currentLatency.toFixed(2)}s latency, nudging live edge`)
+          ensureLiveEdge()
+          try {
+            hls.startLoad()
+            video.play().catch(() => {})
+          } catch (error) {
+            console.warn('Unable to nudge HLS stream:', error)
+          }
+        }
+      }, 4000)
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         console.log('HLS manifest parsed, starting playback')
@@ -314,7 +329,7 @@ function PreviewScreen() {
             hls.autoLevelCapping = -1
             hls.nextAutoLevel = -1
           }
-        }, 15000)
+        }, 8000)
         // Start playback immediately without waiting
         video.play().catch(err => {
           console.error('Error playing HLS video:', err)
@@ -325,7 +340,7 @@ function PreviewScreen() {
       })
       
       let lastFragmentLoadTime = Date.now()
-      const FRAGMENT_STALL_TIMEOUT = 30000 // 30 seconds - if no fragments load for 30s, retry
+      const FRAGMENT_STALL_TIMEOUT = 15000 // 15 seconds - tighter tolerance for low latency
       let fragmentStallTimer = null
       
       const resetFragmentStallTimer = () => {
@@ -512,7 +527,7 @@ function PreviewScreen() {
           })
       }
     }
-  }, [playableUrl, scheduleRetry])
+  }, [captureLastFrame, ensureLiveEdge, playableUrl, scheduleRetry])
 
   // Detect stream type and convert if needed
   useEffect(() => {
@@ -590,6 +605,9 @@ function PreviewScreen() {
       if (hlsRef.current.releaseAutoLevelTimeout) {
         clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
       }
+      if (hlsRef.current.latencyMonitorInterval) {
+        clearInterval(hlsRef.current.latencyMonitorInterval)
+      }
       hlsRef.current.destroy()
       hlsRef.current = null
     }
@@ -621,6 +639,9 @@ function PreviewScreen() {
         }
         if (hlsRef.current.releaseAutoLevelTimeout) {
           clearTimeout(hlsRef.current.releaseAutoLevelTimeout)
+        }
+        if (hlsRef.current.latencyMonitorInterval) {
+          clearInterval(hlsRef.current.latencyMonitorInterval)
         }
         hlsRef.current.destroy()
         hlsRef.current = null
@@ -807,35 +828,6 @@ function PreviewScreen() {
           <div className="error-message">
             <p>📺 Waiting for stream selection</p>
             <p className="error-subtitle">Please select a stream from the Editor Screen</p>
-          </div>
-        )}
-        {hasError && !isLoading && currentStreamUrl && (
-          <div className="error-message">
-            <p>⚠️ Unable to load stream</p>
-            <p className="error-subtitle">
-              {streamInfo?.type === 'rtsp' 
-                ? 'The RTSP stream conversion is not working. Please check the server console for FFmpeg errors.'
-                : 'Stream could not be loaded. Auto-retrying...'}
-            </p>
-            {streamInfo?.type === 'rtsp' && (
-              <div className="rtsp-help">
-                <p><strong>Note:</strong> Browsers cannot play RTSP directly.</p>
-                <p>The app uses a local conversion server (port 8092) to convert RTSP to HLS.</p>
-                <p style={{marginTop: '10px', fontSize: '0.9rem', opacity: 0.9}}>
-                  <strong>Troubleshooting:</strong>
-                </p>
-                <ul style={{textAlign: 'left', marginTop: '8px'}}>
-                  <li>Check if the conversion server is running (port 8092)</li>
-                  <li>Verify FFmpeg is installed and accessible</li>
-                  <li>Check server console for FFmpeg connection errors</li>
-                  <li>Verify the RTSP URL is correct: <code style={{fontSize: '0.85rem'}}>{currentStreamUrl}</code></li>
-                  <li>Test the RTSP URL in VLC to confirm it works</li>
-                </ul>
-                <p style={{marginTop: '10px', fontSize: '0.85rem', opacity: 0.8}}>
-                  The app will automatically retry loading the stream.
-                </p>
-              </div>
-            )}
           </div>
         )}
         {currentOverlayText && (

@@ -29,6 +29,34 @@ const FFMPEG_HANDSHAKE_TIMEOUT = process.env.FFMPEG_HANDSHAKE_TIMEOUT || '150000
 const FFMPEG_RW_TIMEOUT = process.env.FFMPEG_RW_TIMEOUT || '15000000';
 const FORCED_FFMPEG_PROFILE = process.env.FFMPEG_PROFILE || null;
 
+function parseBooleanEnv(value, defaultValue = false) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
+const LOW_LATENCY_HLS = parseBooleanEnv(process.env.LOW_LATENCY_HLS, false);
+const HLS_SEGMENT_DURATION_SEC = parseFloat(process.env.HLS_SEGMENT_DURATION_SEC || (LOW_LATENCY_HLS ? '0.6' : '2')) || (LOW_LATENCY_HLS ? 0.6 : 2);
+const HLS_PART_DURATION_SEC = parseFloat(process.env.HLS_PART_DURATION_SEC || (LOW_LATENCY_HLS ? '0.3' : '0')) || (LOW_LATENCY_HLS ? 0.3 : 0);
+const HLS_PLAYLIST_SIZE = parseInt(process.env.HLS_PLAYLIST_SIZE || (LOW_LATENCY_HLS ? '12' : '150'), 10);
+const USE_FMP4_SEGMENTS = parseBooleanEnv(process.env.HLS_USE_FMP4, LOW_LATENCY_HLS);
+
+const hlsConfig = {
+  lowLatency: LOW_LATENCY_HLS,
+  segmentDuration: HLS_SEGMENT_DURATION_SEC,
+  playlistSize: HLS_PLAYLIST_SIZE,
+  partDuration: HLS_PART_DURATION_SEC,
+  useFmp4: USE_FMP4_SEGMENTS
+};
+
+function getSegmentExtension(streamInfo) {
+  if (streamInfo && streamInfo.segmentExtension) {
+    return streamInfo.segmentExtension;
+  }
+  return hlsConfig.useFmp4 ? 'm4s' : 'ts';
+}
+
 const FFMPEG_PROFILES = [
   {
     name: 'copy-tcp',
@@ -76,8 +104,13 @@ function touchStreamAccess(streamId) {
   }
 }
 
-function buildFfmpegArgs(rtspUrl, playlistPath, segmentPattern, profile) {
+function buildFfmpegArgs(rtspUrl, playlistPath, segmentPattern, profile, customHlsOptions = hlsConfig) {
   const transport = profile.transport || 'tcp';
+  const options = {
+    ...hlsConfig,
+    ...(customHlsOptions || {})
+  };
+  const maxDelay = options.lowLatency ? '100000' : '500000';
   const args = [
     '-loglevel', 'info',
     '-rtsp_transport', transport
@@ -87,27 +120,37 @@ function buildFfmpegArgs(rtspUrl, playlistPath, segmentPattern, profile) {
     args.push('-rtsp_flags', 'prefer_tcp');
   }
 
+  if (options.lowLatency) {
+    args.push(
+      '-fflags', 'nobuffer',
+      '-flags', 'low_delay',
+      '-reorder_queue_size', '0'
+    );
+  }
+
   args.push(
     '-analyzeduration', FFMPEG_ANALYZE_DURATION,
     '-probesize', FFMPEG_PROBE_SIZE,
     '-fflags', '+genpts',
-    '-max_delay', '500000',
+    '-max_delay', maxDelay,
     '-use_wallclock_as_timestamps', '1',
     '-thread_queue_size', '512',
     '-i', rtspUrl
   );
 
   if (profile.transcodeVideo) {
+    const gop = options.lowLatency ? '15' : '30';
     args.push(
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
       '-tune', 'zerolatency',
       '-profile:v', 'baseline',
       '-level', '3.0',
-      '-g', '30',
-      '-keyint_min', '30',
+      '-g', gop,
+      '-keyint_min', gop,
       '-sc_threshold', '0',
-      '-max_muxing_queue_size', '1024'
+      '-max_muxing_queue_size', '1024',
+      '-force_key_frames', `expr:gte(t,n_forced*${options.lowLatency ? '0.5' : '1'})`
     );
   } else {
     args.push(
@@ -117,16 +160,36 @@ function buildFfmpegArgs(rtspUrl, playlistPath, segmentPattern, profile) {
     );
   }
 
+  let hlsFlags = 'delete_segments+omit_endlist+independent_segments';
+  if (options.lowLatency) {
+    const llFlags = ['delete_segments', 'append_list', 'program_date_time', 'omit_endlist', 'independent_segments'];
+    if (options.partDuration > 0) {
+      llFlags.push('part_inf');
+    }
+    hlsFlags = llFlags.join('+');
+  }
+
   args.push(
     '-c:a', 'aac',
     '-ar', '44100',
     '-b:a', '96k',
     '-ac', '2',
-    '-hls_time', '2',
-    '-hls_list_size', '150',
-    '-hls_flags', 'delete_segments+omit_endlist+independent_segments',
-    '-hls_segment_type', 'mpegts',
-    '-hls_segment_filename', segmentPattern,
+    '-hls_time', String(options.segmentDuration),
+    '-hls_list_size', String(options.playlistSize),
+    '-hls_flags', hlsFlags,
+    '-hls_segment_type', options.useFmp4 ? 'fmp4' : 'mpegts',
+    '-hls_segment_filename', segmentPattern
+  );
+
+  if (options.useFmp4) {
+    args.push('-hls_fmp4_init_filename', 'init.mp4');
+  }
+
+  if (options.lowLatency && options.partDuration > 0) {
+    args.push('-hls_part_duration', String(options.partDuration));
+  }
+
+  args.push(
     '-f', 'hls',
     '-start_number', '0',
     '-hls_allow_cache', '0',
@@ -229,13 +292,14 @@ function startFfmpegWithProfile(rtspUrl, streamId, profile) {
     }
 
     const playlistPath = path.join(outputPath, 'playlist.m3u8');
-    const segmentPattern = path.join(outputPath, 'segment_%03d.ts');
+    const segmentExtension = hlsConfig.useFmp4 ? 'm4s' : 'ts';
+    const segmentPattern = path.join(outputPath, `segment_%03d.${segmentExtension}`);
 
     console.log(`FFmpeg output directory: ${outputPath}`);
     console.log(`FFmpeg playlist path: ${playlistPath}`);
     console.log(`FFmpeg segment pattern: ${segmentPattern}`);
 
-    const ffmpegArgs = buildFfmpegArgs(rtspUrl, playlistPath, segmentPattern, profile);
+    const ffmpegArgs = buildFfmpegArgs(rtspUrl, playlistPath, segmentPattern, profile, hlsConfig);
     console.log(`Starting FFmpeg conversion for: ${rtspUrl}`);
     console.log(`FFmpeg profile: ${profile.name}`);
     console.log(`FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
@@ -282,14 +346,15 @@ function startFfmpegWithProfile(rtspUrl, streamId, profile) {
         console.log(`ℹ️ FFmpeg [${streamId}]:`, output.trim());
       }
 
-      if (output.includes('Opening') && output.includes('.ts')) {
+      if (output.includes('Opening') && (output.includes('.ts') || output.includes('.m4s'))) {
         console.log(`✅ FFmpeg [${streamId}]: Creating segment file`);
         const streamInfo = activeStreams.get(streamId);
         if (streamInfo) {
           streamInfo.lastSegmentTime = Date.now();
           try {
+            const currentExtension = getSegmentExtension(streamInfo);
             const segmentFiles = fs.readdirSync(streamInfo.outputPath)
-              .filter(f => f.endsWith('.ts'));
+              .filter(f => f.endsWith(`.${currentExtension}`));
             streamInfo.lastSegmentCount = segmentFiles.length;
           } catch {
             // ignore
@@ -345,7 +410,8 @@ function startFfmpegWithProfile(rtspUrl, streamId, profile) {
           lastSegmentCount: 0,
           restartCount: 0,
           profileName: profile.name,
-          lastRequestTime: Date.now()
+          lastRequestTime: Date.now(),
+          segmentExtension
         });
         console.log(`✅ FFmpeg conversion started successfully for: ${streamId} (profile ${profile.name})`);
         resolve();
@@ -383,7 +449,8 @@ function startFfmpegWithProfile(rtspUrl, streamId, profile) {
             lastSegmentCount: 0,
             restartCount: 0,
             profileName: profile.name,
-            lastRequestTime: Date.now()
+            lastRequestTime: Date.now(),
+            segmentExtension
           });
           resolve();
         }
@@ -408,7 +475,7 @@ function performHealthCheck() {
   const MAX_RESTARTS = 5; // Maximum number of restarts per stream
   
   activeStreams.forEach(async (streamInfo, streamId) => {
-    const { process, rtspUrl, outputPath, lastSegmentTime, lastSegmentCount, restartCount, lastRequestTime, profileName } = streamInfo;
+    const { process, rtspUrl, outputPath, lastSegmentTime, lastSegmentCount, restartCount, lastRequestTime, profileName, segmentExtension } = streamInfo;
     
     // Check if process is still running
     if (!process || process.killed) {
@@ -437,8 +504,9 @@ function performHealthCheck() {
     
     // Check if segments are still being generated
     try {
+      const extension = segmentExtension || getSegmentExtension(streamInfo);
       const segmentFiles = fs.readdirSync(outputPath)
-        .filter(f => f.endsWith('.ts'))
+        .filter(f => f.endsWith(`.${extension}`))
         .map(f => {
           const filePath = path.join(outputPath, f);
           const stats = fs.statSync(filePath);
@@ -698,7 +766,7 @@ const server = http.createServer(async (req, res) => {
   // Convert RTSP to HLS endpoint
   if (url.pathname.startsWith('/hls/')) {
     // Extract encoded URL from path
-    // Format: /hls/{encodedUrl}/playlist.m3u8 or /hls/{encodedUrl}/segment_000.ts
+    // Format: /hls/{encodedUrl}/playlist.m3u8 or /hls/{encodedUrl}/segment_000.ts (or .m4s)
     // The encoded URL may contain slashes, so we need to be careful
     let pathAfterHls = url.pathname.replace('/hls/', '');
     
@@ -864,7 +932,8 @@ const server = http.createServer(async (req, res) => {
           cleanupStreamArtifacts(streamId);
         } else {
           // Check if segments are being created (not empty)
-          const segmentPath = path.join(existingStream.outputPath, 'segment_000.ts');
+          const existingExtension = existingStream.segmentExtension || getSegmentExtension(existingStream);
+          const segmentPath = path.join(existingStream.outputPath, `segment_000.${existingExtension}`);
           if (fs.existsSync(segmentPath)) {
             const stats = fs.statSync(segmentPath);
             if (stats.size === 0) {
@@ -927,7 +996,9 @@ const server = http.createServer(async (req, res) => {
         playlistReady = true;
         
         // Check if at least one segment exists and has content
-        const firstSegment = path.join(outputPath, 'segment_000.ts');
+        const currentStreamInfo = activeStreams.get(streamId);
+        const expectedExtension = getSegmentExtension(currentStreamInfo);
+        const firstSegment = path.join(outputPath, `segment_000.${expectedExtension}`);
         if (fs.existsSync(firstSegment)) {
           const stats = fs.statSync(firstSegment);
           if (stats.size > 0) {
@@ -958,7 +1029,9 @@ const server = http.createServer(async (req, res) => {
       
       // Check segment files
       if (fs.existsSync(outputPath)) {
-        const segmentFiles = fs.readdirSync(outputPath).filter(f => f.endsWith('.ts'));
+        const currentStreamInfo = activeStreams.get(streamId);
+        const extensionForLog = getSegmentExtension(currentStreamInfo);
+        const segmentFiles = fs.readdirSync(outputPath).filter(f => f.endsWith(`.${extensionForLog}`));
         console.log(`Segment files found: ${segmentFiles.length}`);
         segmentFiles.forEach(file => {
           const filePath = path.join(outputPath, file);
@@ -1017,7 +1090,7 @@ const server = http.createServer(async (req, res) => {
         
         // Update segment paths to be absolute URLs pointing to this server
         // This ensures network users can access segments from the server
-        // Handle both relative paths (segment_000.ts) and absolute paths
+        // Handle both relative paths (segment_000.ts/m4s) and absolute paths
         let updatedPlaylist = playlist;
         
         // CRITICAL: Use the clean encoded URL (the one we extracted/cleaned earlier)
@@ -1025,13 +1098,13 @@ const server = http.createServer(async (req, res) => {
         const cleanEncodedUrl = encodeURIComponent(rtspUrl);
         
         // Step 1: Replace ALL absolute URLs (including malformed ones) with correct ones
-        // This pattern matches any absolute URL that contains /hls/ and ends with segment_XXX.ts
+        // This pattern matches any absolute URL that contains /hls/ and ends with segment_XXX.ts or segment_XXX.m4s
         // It will catch malformed URLs like: http://.../hls/.../http://.../hls/.../segment_000.ts
         updatedPlaylist = updatedPlaylist.replace(
-          /https?:\/\/[^\s\r\n]*\/hls\/[^\s\r\n]*\/segment_\d+\.ts/gi,
+          /https?:\/\/[^\s\r\n]*\/hls\/[^\s\r\n]*\/segment_\d+\.(?:ts|m4s)/gi,
           (match) => {
             // Extract just the segment filename (last occurrence in case of malformed URL)
-            const segmentMatches = match.match(/segment_\d+\.ts/g);
+            const segmentMatches = match.match(/segment_\d+\.(?:ts|m4s)/g);
             if (segmentMatches && segmentMatches.length > 0) {
               const segmentName = segmentMatches[segmentMatches.length - 1]; // Get last match
               return `${baseUrl}/hls/${cleanEncodedUrl}/${segmentName}`;
@@ -1040,20 +1113,20 @@ const server = http.createServer(async (req, res) => {
           }
         );
         
-        // Step 2: Handle relative segment paths (lines that just have segment_XXX.ts)
+        // Step 2: Handle relative segment paths (lines that just have segment_XXX.(ts|m4s))
         // Match segment names that are on their own line (after #EXTINF)
         // Only match if the line doesn't already start with http:// or https://
         updatedPlaylist = updatedPlaylist.replace(
-          /^(segment_\d+\.ts)$/gm,
+          /^(segment_\d+\.(?:ts|m4s))$/gm,
           (match) => {
             return `${baseUrl}/hls/${cleanEncodedUrl}/${match}`;
           }
         );
         
         // Step 3: Handle any remaining relative paths that might have been missed
-        // This catches segment_XXX.ts that might be on lines with other content
+        // This catches segment_XXX.(ts|m4s) that might be on lines with other content
         updatedPlaylist = updatedPlaylist.replace(
-          /([\r\n])(segment_\d+\.ts)([\r\n\s]|$)/g,
+          /([\r\n])(segment_\d+\.(?:ts|m4s))([\r\n\s]|$)/g,
           (match, lineBreak, segmentName, suffix) => {
             // Check if this line already has an absolute URL by looking at the line
             const lineStart = match;
@@ -1079,16 +1152,17 @@ const server = http.createServer(async (req, res) => {
           'Access-Control-Allow-Origin': '*'
         });
         res.end(updatedPlaylist);
-      } else if (url.pathname.endsWith('.ts')) {
-        // Serve HLS segments
+      } else if (url.pathname.match(/\.(ts|m4s|mp4)$/i)) {
+        // Serve HLS segments (TS or CMAF)
         const segmentName = url.pathname.split('/').pop();
         const segmentPath = path.join(HLS_OUTPUT_DIR, streamId, segmentName);
         console.log(`Segment request: ${segmentName} from ${req.headers.host || 'unknown'}, path: ${segmentPath}`);
         if (fs.existsSync(segmentPath)) {
           const segment = fs.readFileSync(segmentPath);
           console.log(`Serving segment: ${segmentName} (${segment.length} bytes)`);
+          const isMp4Like = segmentName.endsWith('.m4s') || segmentName.endsWith('.mp4');
           res.writeHead(200, { 
-            'Content-Type': 'video/mp2t',
+            'Content-Type': isMp4Like ? 'video/mp4' : 'video/mp2t',
             'Cache-Control': 'no-cache',
             'Access-Control-Allow-Origin': '*'
           });
