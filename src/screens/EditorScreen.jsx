@@ -25,6 +25,7 @@ function EditorScreen() {
   const [editingButton, setEditingButton] = useState(null) // Track which button is being edited: { id, name, url, ip }
   const [editIp, setEditIp] = useState('')
   const [editName, setEditName] = useState('')
+  const [editPort, setEditPort] = useState('8000')
   const [panelWidth, setPanelWidth] = useState(() => {
     const stored = localStorage.getItem('editor-panel-width')
     return stored ? Math.min(MAX_PANEL_WIDTH, Math.max(MIN_PANEL_WIDTH, parseInt(stored, 10))) : DEFAULT_PANEL_WIDTH
@@ -389,11 +390,33 @@ function EditorScreen() {
     navigate('/user')
   }
 
+  const handleNavigateToPreview = () => {
+    navigate('/preview')
+  }
+
   const handleEditButton = (button, e) => {
     e.stopPropagation()
     setEditingButton(button)
-    setEditIp(button.ip || '')
+    
+    // Extract IP and port from existing URL
+    let extractedIp = button.ip || ''
+    let extractedPort = '8000' // Default port
+    
+    if (button.url) {
+      // Parse RTSP URL: rtsp://IP:PORT/path
+      const urlMatch = button.url.match(/rtsp:\/\/([^:]+):(\d+)/)
+      if (urlMatch) {
+        extractedIp = urlMatch[1]
+        extractedPort = urlMatch[2]
+      } else if (button.ip) {
+        // Fallback to stored IP if URL parsing fails
+        extractedIp = button.ip
+      }
+    }
+    
+    setEditIp(extractedIp)
     setEditName(button.name || '')
+    setEditPort(extractedPort)
   }
 
   const handleSaveEdit = () => {
@@ -406,9 +429,16 @@ function EditorScreen() {
       return
     }
 
+    // Validate port
+    const port = parseInt(editPort.trim(), 10)
+    if (isNaN(port) || port < 1 || port > 65535) {
+      showNotification('Port must be a number between 1 and 65535', 'error')
+      return
+    }
+
     const trimmedIp = editIp.trim()
     const trimmedName = editName.trim()
-    const rtspUrl = `rtsp://${trimmedIp}:8000/media/video2`
+    const rtspUrl = `rtsp://${trimmedIp}:${port}/media/video2`
     
     const updatedButtons = savedButtons.map(btn => 
       btn.id === editingButton.id 
@@ -431,6 +461,7 @@ function EditorScreen() {
     setEditingButton(null)
     setEditIp('')
     setEditName('')
+    setEditPort('8000')
     showNotification('Button updated successfully!', 'success')
     
     // Recheck connection status for updated button
@@ -443,6 +474,7 @@ function EditorScreen() {
     setEditingButton(null)
     setEditIp('')
     setEditName('')
+    setEditPort('8000')
   }
 
   const handleDeleteButton = (id, e) => {
@@ -569,6 +601,19 @@ function EditorScreen() {
                             />
                           </div>
                           <div className="editor-panel-input">
+                            <label htmlFor={`edit-port-${button.id}`}>Port</label>
+                            <input
+                              id={`edit-port-${button.id}`}
+                              type="number"
+                              min="1"
+                              max="65535"
+                              value={editPort}
+                              onChange={(e) => setEditPort(e.target.value)}
+                              className="input-field"
+                              placeholder="8000"
+                            />
+                          </div>
+                          <div className="editor-panel-input">
                             <label htmlFor={`edit-name-${button.id}`}>اسم المديرية (Directorate Name)</label>
                             <input
                               id={`edit-name-${button.id}`}
@@ -657,18 +702,25 @@ function EditorScreen() {
           <h1 className="editor-title">Editor Screen</h1>
           <div className="header-buttons">
             <button 
+              onClick={handleNavigateToPreview}
+              className="preview-button"
+              title="Navigate to Preview Screen"
+            >
+              📺 Preview Screen
+            </button>
+            <button 
               onClick={handleNavigateToUserScreen}
               className="preview-button"
               title="Navigate to User Screen"
             >
-              👥 Go to User Screen
+              👥 User Screen
             </button>
             <button 
               onClick={handleOpenPreviewInNewTab}
               className="preview-button"
               title="Open Preview Screen in new tab"
             >
-              📺 Go to Preview Screen
+              📺 Preview (New Tab)
             </button>
           </div>
         </div>

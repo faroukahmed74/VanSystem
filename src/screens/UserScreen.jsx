@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useContext, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
 import Hls from 'hls.js'
 import Notification from '../components/Notification'
+import GridVideoPlayer from '../components/GridVideoPlayer'
 import { StreamContext } from '../context/StreamContext'
 import { loadSavedButtons, saveButtons } from '../utils/storage'
 import { createWebSocketConnection, reconnectWebSocket, sendWebSocketMessage } from '../utils/websocket'
@@ -11,6 +13,7 @@ import './PreviewScreen.css'
 
 function UserScreen() {
   console.log('UserScreen component rendering')
+  const navigate = useNavigate()
   const { streamUrl: contextStreamUrl, overlayText: contextOverlayText, setStreamUrl, setOverlayText } = useContext(StreamContext)
   const [savedButtons, setSavedButtons] = useState([])
   const [buttonStatus, setButtonStatus] = useState({})
@@ -24,6 +27,18 @@ function UserScreen() {
   const currentStreamUrlRef = useRef(contextStreamUrl)
   const wsRef = useRef(null)
   const reconnectRef = useRef(null)
+  
+  // Grid layout state
+  const [gridX, setGridX] = useState(1)
+  const [gridY, setGridY] = useState(1)
+  const [gridStreams, setGridStreams] = useState({}) // { cellId: { streamUrl, overlayText, buttonId } }
+  const gridStreamsRef = useRef({})
+  const [draggedButton, setDraggedButton] = useState(null)
+
+  // Keep ref in sync with state
+  useEffect(() => {
+    gridStreamsRef.current = gridStreams
+  }, [gridStreams])
 
   // Video/player state (borrowed from Preview screen)
   const videoRef = useRef(null)
@@ -304,6 +319,115 @@ function UserScreen() {
     showNotification(`Launching stream "${button.name}"`, 'success')
   }
 
+  // Drag and drop handlers
+  const handleDragStart = (e, button) => {
+    console.log('Drag start:', button.name, button.id)
+    setDraggedButton(button)
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', button.id)
+    e.dataTransfer.setData('application/json', JSON.stringify(button))
+    e.currentTarget.style.opacity = '0.5'
+  }
+
+  const handleDragEnd = (e) => {
+    e.currentTarget.style.opacity = '1'
+    setDraggedButton(null)
+  }
+
+  const handleDragOver = (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    e.dataTransfer.dropEffect = 'move'
+    e.currentTarget.classList.add('drag-over')
+  }
+
+  const handleDragLeave = (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    // Only remove class if we're leaving the cell itself, not a child
+    if (e.currentTarget === e.target) {
+      e.currentTarget.classList.remove('drag-over')
+    }
+  }
+
+  const handleDrop = (e, cellId) => {
+    e.preventDefault()
+    e.stopPropagation()
+    e.currentTarget.classList.remove('drag-over')
+    
+    console.log('Drop event on cell:', cellId)
+    
+    // Try to get button data from dataTransfer
+    let buttonId = e.dataTransfer.getData('text/plain')
+    let button = null
+    
+    // If text/plain didn't work, try JSON
+    if (!buttonId) {
+      try {
+        const buttonData = e.dataTransfer.getData('application/json')
+        if (buttonData) {
+          button = JSON.parse(buttonData)
+          buttonId = button.id
+        }
+      } catch (err) {
+        console.error('Error parsing drag data:', err)
+      }
+    }
+    
+    // Fallback to state if dataTransfer didn't work
+    if (!button && draggedButton) {
+      button = draggedButton
+      buttonId = button.id
+    }
+    
+    // Last resort: find by ID from savedButtons
+    if (!button && buttonId) {
+      button = savedButtons.find(b => b.id === buttonId)
+    }
+    
+    if (!button) {
+      console.error('Could not find button data for drop')
+      return
+    }
+
+    console.log('Adding stream to cell:', cellId, button.name, button.url)
+
+    setGridStreams(prev => ({
+      ...prev,
+      [cellId]: {
+        streamUrl: button.url,
+        overlayText: button.name,
+        buttonId: button.id
+      }
+    }))
+
+    showNotification(`Stream "${button.name}" added to grid cell`, 'success')
+    setDraggedButton(null)
+  }
+
+  const handleClearCell = (cellId) => {
+    setGridStreams(prev => {
+      const updated = { ...prev }
+      delete updated[cellId]
+      return updated
+    })
+    showNotification('Cell cleared', 'info')
+  }
+
+  // Generate grid cells
+  const generateGridCells = () => {
+    const cells = []
+    const totalCells = gridX * gridY
+    
+    for (let i = 0; i < totalCells; i++) {
+      const cellId = `cell-${i}`
+      const cellData = gridStreams[cellId] || null
+      cells.push({ id: cellId, data: cellData })
+    }
+    
+    return cells
+  }
+
   useEffect(() => {
     const handleMessage = (data, origin = 'server') => {
       if (!data || !data.type) return
@@ -311,6 +435,38 @@ function UserScreen() {
       if (data.type === 'buttonCreated' || data.type === 'buttonDeleted' || data.type === 'buttonUpdated' || data.type === 'buttonsSync' || data.type === 'connected') {
         const incomingButtons = data.allButtons || data.buttons
         if (incomingButtons && Array.isArray(incomingButtons)) {
+          // If a button was updated, update any grid cells using that button
+          if (data.type === 'buttonUpdated' && data.buttonId) {
+            const updatedButton = incomingButtons.find(b => b.id === data.buttonId)
+            if (updatedButton) {
+              // Check if any grid cells are using this button
+              const currentGridStreams = gridStreamsRef.current
+              let hasUpdates = false
+              Object.keys(currentGridStreams).forEach(cellId => {
+                if (currentGridStreams[cellId] && currentGridStreams[cellId].buttonId === data.buttonId) {
+                  hasUpdates = true
+                }
+              })
+              
+              if (hasUpdates) {
+                setGridStreams(prev => {
+                  const updated = { ...prev }
+                  Object.keys(updated).forEach(cellId => {
+                    if (updated[cellId] && updated[cellId].buttonId === data.buttonId) {
+                      updated[cellId] = {
+                        streamUrl: updatedButton.url,
+                        overlayText: updatedButton.name,
+                        buttonId: updatedButton.id
+                      }
+                    }
+                  })
+                  return updated
+                })
+                showNotification(`Stream "${updatedButton.name}" updated in grid`, 'info')
+              }
+            }
+          }
+          
           setSavedButtons(incomingButtons)
           if (incomingButtons.length > 0) {
             saveButtons(incomingButtons)
@@ -1127,6 +1283,9 @@ function UserScreen() {
                     key={button.id}
                     className={`user-button ${isSelected ? 'active' : ''} status-${status}`}
                     onClick={() => handleStreamLaunch(button)}
+                    draggable
+                    onDragStart={(e) => handleDragStart(e, button)}
+                    onDragEnd={handleDragEnd}
                   >
                     <div className="user-button-header">
                       <div className="user-button-name-group">
@@ -1159,84 +1318,132 @@ function UserScreen() {
 
         <main className="user-main">
           <header className="user-main-header">
-            <h1>User Page</h1>
+            <div className="user-header-top">
+              <h1>User Page</h1>
+              <div className="header-buttons">
+                <button 
+                  onClick={() => navigate('/editor')}
+                  className="nav-button"
+                  title="Navigate to Editor Screen"
+                >
+                  ✏️ Editor Screen
+                </button>
+                <button 
+                  onClick={() => navigate('/preview')}
+                  className="nav-button"
+                  title="Navigate to Preview Screen"
+                >
+                  📺 Preview Screen
+                </button>
+              </div>
+            </div>
+            <div className="grid-controls">
+              <div className="grid-control-group">
+                <label htmlFor="grid-x">Grid Columns (X):</label>
+                <input
+                  id="grid-x"
+                  type="number"
+                  min="1"
+                  max="8"
+                  value={gridX}
+                  onChange={(e) => {
+                    const val = Math.max(1, Math.min(8, parseInt(e.target.value) || 1))
+                    setGridX(val)
+                    // Clear streams that are outside new grid bounds
+                    const newTotal = val * gridY
+                    setGridStreams(prev => {
+                      const updated = {}
+                      Object.keys(prev).forEach(key => {
+                        const cellIndex = parseInt(key.split('-')[1])
+                        if (cellIndex < newTotal) {
+                          updated[key] = prev[key]
+                        }
+                      })
+                      return updated
+                    })
+                  }}
+                  className="grid-input"
+                />
+              </div>
+              <div className="grid-control-group">
+                <label htmlFor="grid-y">Grid Rows (Y):</label>
+                <input
+                  id="grid-y"
+                  type="number"
+                  min="1"
+                  max="8"
+                  value={gridY}
+                  onChange={(e) => {
+                    const val = Math.max(1, Math.min(8, parseInt(e.target.value) || 1))
+                    setGridY(val)
+                    // Clear streams that are outside new grid bounds
+                    const newTotal = gridX * val
+                    setGridStreams(prev => {
+                      const updated = {}
+                      Object.keys(prev).forEach(key => {
+                        const cellIndex = parseInt(key.split('-')[1])
+                        if (cellIndex < newTotal) {
+                          updated[key] = prev[key]
+                        }
+                      })
+                      return updated
+                    })
+                  }}
+                  className="grid-input"
+                />
+              </div>
+              <div className="grid-info">
+                <span>Total Cells: {gridX * gridY}</span>
+              </div>
+            </div>
           </header>
 
           <div className="user-player">
-            <div className="video-container">
-              <video
-                ref={videoRef}
-                className="video-stream"
-                autoPlay
-                muted
-                playsInline
-                controls
-                onLoadedData={() => {
-                  setIsLoading(false)
-                  setHasError(false)
-                  isStreamPlayingRef.current = true
-                  captureLastFrame()
-                }}
-                onTimeUpdate={() => {
-                  // Capture frame periodically during playback (like PreviewScreen)
-                  if (videoRef.current && !videoRef.current.paused && videoRef.current.readyState >= 2) {
-                    // Capture every 2 seconds during playback
-                    const now = Date.now()
-                    if (!lastFrameRef.current || now % 2000 < 100) {
-                      captureLastFrame()
-                    }
-                  }
-                }}
-                onError={(e) => {
-                  console.error('Video element error:', e)
-                  setIsLoading(false)
-                  setHasError(true)
-                  captureLastFrame()
-                }}
-                onStalled={() => {
-                  console.warn('Video stalled')
-                  // Capture frame when stalled
-                  captureLastFrame()
-                  if (playableUrl && scheduleRetryRef.current) {
-                    scheduleRetryRef.current()
-                  }
-                }}
-              />
-              {hasError && lastFrameRef.current && (
-                <img
-                  src={lastFrameRef.current}
-                  alt="Last frame"
-                  className="last-frame-overlay"
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    height: '100%',
-                    objectFit: 'contain',
-                    zIndex: 1,
-                    pointerEvents: 'none'
-                  }}
-                />
-              )}
-              {isLoading && (
-                <div className="loading-indicator">
-                  <div className="spinner"></div>
-                  <p>Loading stream...</p>
+            <div 
+              className="grid-container"
+              style={{
+                display: 'grid',
+                gridTemplateColumns: `repeat(${gridX}, 1fr)`,
+                gridTemplateRows: `repeat(${gridY}, 1fr)`,
+                gap: '12px',
+                width: '100%',
+                height: '100%',
+                minHeight: '600px'
+              }}
+            >
+              {generateGridCells().map((cell) => (
+                <div
+                  key={cell.id}
+                  className="grid-cell"
+                  onDragOver={handleDragOver}
+                  onDragLeave={handleDragLeave}
+                  onDrop={(e) => handleDrop(e, cell.id)}
+                >
+                  {cell.data ? (
+                    <div className="grid-cell-content">
+                      <button
+                        className="grid-cell-clear"
+                        onClick={() => handleClearCell(cell.id)}
+                        title="Clear cell"
+                      >
+                        ×
+                      </button>
+                      <GridVideoPlayer
+                        streamUrl={cell.data.streamUrl}
+                        overlayText={cell.data.overlayText}
+                        cellId={cell.id}
+                        onError={() => {
+                          showNotification(`Stream error in ${cell.id}`, 'error')
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="grid-cell-empty">
+                      <p>Drop stream here</p>
+                    </div>
+                  )}
                 </div>
-              )}
-              {!currentStreamUrl && !isLoading && (
-                <div className="error-message">
-                  <img src={policeLogo} alt="Police logo" style={{ width: '120px', marginBottom: '16px' }} />
-                  <p>📺 Waiting for stream selection</p>
-                  <p className="error-subtitle">Please select a stream from the panel to begin.</p>
-                </div>
-              )}
-              {currentOverlayText && (
-                <div className="overlay-text">
-                  {currentOverlayText}
-                </div>
-              )}
+              ))}
             </div>
           </div>
         </main>

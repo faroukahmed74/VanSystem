@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { StreamContext } from '../context/StreamContext'
 import { createWebSocketConnection, reconnectWebSocket, sendWebSocketMessage } from '../utils/websocket'
 import { detectStreamType, getPlayableUrl } from '../utils/streamConverter'
+import { loadSavedButtons } from '../utils/storage'
 import Hls from 'hls.js'
 import './PreviewScreen.css'
 
@@ -18,6 +19,8 @@ function PreviewScreen() {
   const [hasError, setHasError] = useState(false)
   const [streamInfo, setStreamInfo] = useState(null)
   const [playableUrl, setPlayableUrl] = useState(null)
+  const [savedButtons, setSavedButtons] = useState([])
+  const [currentButtonId, setCurrentButtonId] = useState(null)
   const retryTimeoutRef = useRef(null)
   const retryCountRef = useRef(0)
   const maxRetries = Infinity // Keep retrying indefinitely until IP changes
@@ -71,19 +74,44 @@ function PreviewScreen() {
     console.log(`Applying stream update (${origin})`, streamData.streamUrl)
     cleanupStreamResources()
 
+    // Find which button this stream URL belongs to
+    const matchingButton = savedButtons.find(btn => btn.url === streamData.streamUrl)
+    const buttonId = matchingButton ? matchingButton.id : null
+
     setCurrentStreamUrl(streamData.streamUrl)
     setCurrentOverlayText(streamData.overlayText || '')
+    setCurrentButtonId(buttonId)
     setStreamUrl(streamData.streamUrl)
     setOverlayText(streamData.overlayText || '')
     setIsLoading(true)
     setHasError(false)
-  }, [cleanupStreamResources, setOverlayText, setStreamUrl])
+  }, [cleanupStreamResources, setOverlayText, setStreamUrl, savedButtons])
 
   const requestLatestStream = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       sendWebSocketMessage(wsRef.current, 'requestCurrentStream', {})
     }
   }, [])
+
+  // Load saved buttons on mount
+  useEffect(() => {
+    const loaded = loadSavedButtons()
+    if (loaded && loaded.length > 0) {
+      setSavedButtons(loaded)
+    }
+  }, [])
+
+  // Update currentButtonId when savedButtons or currentStreamUrl changes
+  useEffect(() => {
+    if (currentStreamUrl && savedButtons.length > 0) {
+      const matchingButton = savedButtons.find(btn => btn.url === currentStreamUrl)
+      if (matchingButton && matchingButton.id !== currentButtonId) {
+        setCurrentButtonId(matchingButton.id)
+      } else if (!matchingButton && currentButtonId) {
+        setCurrentButtonId(null)
+      }
+    }
+  }, [currentStreamUrl, savedButtons, currentButtonId])
 
   useEffect(() => {
     const handleMessage = (data, origin = 'server') => {
@@ -97,6 +125,24 @@ function PreviewScreen() {
         }
       } else if (data.type === 'currentStream') {
         applyStreamUpdate(data, 'current-state')
+      } else if (data.type === 'buttonUpdated' || data.type === 'buttonCreated' || data.type === 'buttonDeleted' || data.type === 'buttonsSync') {
+        // Update saved buttons list
+        const incomingButtons = data.allButtons || data.buttons
+        if (incomingButtons && Array.isArray(incomingButtons)) {
+          setSavedButtons(incomingButtons)
+          
+          // If a button was updated and it's currently playing, update the stream
+          if (data.type === 'buttonUpdated' && data.buttonId && currentButtonId === data.buttonId) {
+            const updatedButton = incomingButtons.find(b => b.id === data.buttonId)
+            if (updatedButton && updatedButton.url !== currentStreamUrl) {
+              console.log('Currently playing button was updated, updating stream to new URL')
+              applyStreamUpdate({
+                streamUrl: updatedButton.url,
+                overlayText: updatedButton.name
+              }, 'button-update')
+            }
+          }
+        }
       }
     }
 
@@ -138,7 +184,7 @@ function PreviewScreen() {
         wsRef.current.close(1000, 'Component unmounting')
       }
     }
-  }, [applyStreamUpdate, requestLatestStream])
+  }, [applyStreamUpdate, requestLatestStream, currentButtonId, currentStreamUrl])
 
   const ensureLiveEdge = useCallback(() => {
     const video = videoRef.current
@@ -757,8 +803,34 @@ function PreviewScreen() {
     navigate('/editor')
   }
 
+  const handleNavigateToEditor = () => {
+    navigate('/editor')
+  }
+
+  const handleNavigateToUser = () => {
+    navigate('/user')
+  }
+
   return (
     <div className="preview-screen">
+      <div className="preview-header-right">
+        <div className="header-buttons">
+          <button 
+            onClick={handleNavigateToEditor}
+            className="nav-button"
+            title="Navigate to Editor Screen"
+          >
+            ✏️ Editor Screen
+          </button>
+          <button 
+            onClick={handleNavigateToUser}
+            className="nav-button"
+            title="Navigate to User Screen"
+          >
+            👥 User Screen
+          </button>
+        </div>
+      </div>
       <div className="video-container">
         <video
           ref={videoRef}
@@ -836,9 +908,6 @@ function PreviewScreen() {
           </div>
         )}
       </div>
-      <button className="back-button" onClick={handleBack}>
-        Back to Editor
-      </button>
     </div>
   )
 }
