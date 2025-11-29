@@ -727,11 +727,11 @@ function EditorScreen() {
         
         <div className="input-section">
           <div className="input-group">
-            <label htmlFor="ip-input">IP Address</label>
+            <label htmlFor="ip-input"> الرقم التعريفي للسيارة الفان (IP Address)</label>
             <input
               id="ip-input"
               type="text"
-              placeholder="Enter IP address (e.g., 192.168.1.100)"
+              placeholder=" Enter IP address (e.g., 10.0.X.X)"
               value={ip}
               onChange={(e) => setIp(e.target.value)}
               className="input-field"
