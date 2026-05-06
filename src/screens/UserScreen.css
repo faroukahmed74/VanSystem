@@ -206,6 +206,19 @@
   margin-bottom: 20px;
   flex-wrap: wrap;
   gap: 15px;
+  position: relative;
+}
+
+.user-header-credit {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: #888;
+  opacity: 0.75;
+  font-weight: 400;
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 .user-header-top .header-buttons {

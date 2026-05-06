@@ -4,36 +4,39 @@
 Write-Host "Checking Windows Firewall rules for Van System..." -ForegroundColor Cyan
 Write-Host ""
 
-$ports = @(
-    @{Port=8090; Name="Vite Server"},
-    @{Port=8091; Name="WebSocket Server"},
-    @{Port=8092; Name="RTSP Converter"}
+$rules = @(
+    @{ Port = 8090; Name = "Vite Server"; RuleName = "Van System - Vite Server" },
+    @{ Port = 8091; Name = "WebSocket Server"; RuleName = "Van System - WebSocket Server" },
+    @{ Port = 8092; Name = "RTSP Converter"; RuleName = "Van System - RTSP Converter" }
 )
 
 $allConfigured = $true
 
-foreach ($portInfo in $ports) {
-    $port = $portInfo.Port
-    $name = $portInfo.Name
-    
+foreach ($entry in $rules) {
     try {
-        $rule = Get-NetFirewallRule -DisplayName "*Van System*" -ErrorAction SilentlyContinue | 
-                Where-Object { $_.DisplayName -like "*$name*" -or $_.DisplayName -like "*$port*" }
-        
-        if ($rule) {
-            $enabled = ($rule | Where-Object { $_.Enabled -eq $true })
-            if ($enabled) {
-                Write-Host "[OK] Port $port ($name) - Firewall rule exists and is ENABLED" -ForegroundColor Green
-            } else {
-                Write-Host "[WARN] Port $port ($name) - Firewall rule exists but is DISABLED" -ForegroundColor Yellow
-                $allConfigured = $false
+        $rule = Get-NetFirewallRule -DisplayName $entry.RuleName -ErrorAction SilentlyContinue
+        if (-not $rule) {
+            Write-Host ("[MISSING] Port {0} ({1}) - No firewall rule found" -f $entry.Port, $entry.Name) -ForegroundColor Red
+            $allConfigured = $false
+            continue
+        }
+
+        $ruleEnabled = $false
+        foreach ($r in @($rule)) {
+            if ("$($r.Enabled)" -eq "True") {
+                $ruleEnabled = $true
+                break
             }
+        }
+
+        if ($ruleEnabled) {
+            Write-Host ("[OK] Port {0} ({1}) - Firewall rule exists and is ENABLED" -f $entry.Port, $entry.Name) -ForegroundColor Green
         } else {
-            Write-Host "[MISSING] Port $port ($name) - No firewall rule found" -ForegroundColor Red
+            Write-Host ("[WARN] Port {0} ({1}) - Firewall rule exists but is DISABLED" -f $entry.Port, $entry.Name) -ForegroundColor Yellow
             $allConfigured = $false
         }
     } catch {
-        Write-Host "[ERROR] Could not check port $port - Run as Administrator" -ForegroundColor Red
+        Write-Host ("[ERROR] Could not check port {0} - Run as Administrator" -f $entry.Port) -ForegroundColor Red
         $allConfigured = $false
     }
 }
@@ -45,4 +48,3 @@ if ($allConfigured) {
     Write-Host "Some firewall rules are missing or disabled." -ForegroundColor Yellow
     Write-Host "Run setup-firewall.ps1 as Administrator to configure them." -ForegroundColor Cyan
 }
-

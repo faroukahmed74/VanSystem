@@ -1,51 +1,37 @@
 # PowerShell script to configure Windows Firewall for Van System
 # Run this script as Administrator
-# This script allows all ports for ALL network profiles (Domain, Private, Public)
+# This script allows all ports for all network profiles (Domain, Private, Public)
+
+$ErrorActionPreference = "Stop"
 
 Write-Host "Configuring Windows Firewall for Van System..." -ForegroundColor Green
-Write-Host "Allowing ports for ALL network profiles (Domain, Private, Public)..." -ForegroundColor Yellow
+Write-Host "Allowing ports for all network profiles (Domain, Private, Public)..." -ForegroundColor Yellow
 Write-Host ""
 
-# Remove existing rules if they exist (to avoid duplicates)
+$rules = @(
+    @{ Name = "Van System - Vite Server"; Port = 8090; Label = "Vite Server" },
+    @{ Name = "Van System - WebSocket Server"; Port = 8091; Label = "WebSocket Server" },
+    @{ Name = "Van System - RTSP Converter"; Port = 8092; Label = "RTSP Converter" }
+)
+
 Write-Host "Removing existing rules (if any)..." -ForegroundColor Cyan
-Remove-NetFirewallRule -DisplayName "Van System - Vite Server" -ErrorAction SilentlyContinue
-Remove-NetFirewallRule -DisplayName "Van System - WebSocket Server" -ErrorAction SilentlyContinue
-Remove-NetFirewallRule -DisplayName "Van System - RTSP Converter" -ErrorAction SilentlyContinue
-
+foreach ($rule in $rules) {
+    Remove-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue
+}
 Write-Host ""
 
-# Allow Vite dev server (port 8090) - ALL NETWORKS
-New-NetFirewallRule `
-    -DisplayName "Van System - Vite Server" `
-    -Direction Inbound `
-    -LocalPort 8090 `
-    -Protocol TCP `
-    -Action Allow `
-    -Profile Any `
-    -ErrorAction SilentlyContinue
-Write-Host "✓ Port 8090 (Vite Server) - Allowed for ALL networks" -ForegroundColor Green
+foreach ($rule in $rules) {
+    New-NetFirewallRule `
+        -DisplayName $rule.Name `
+        -Direction Inbound `
+        -LocalPort $rule.Port `
+        -Protocol TCP `
+        -Action Allow `
+        -Profile Any `
+        -ErrorAction SilentlyContinue | Out-Null
 
-# Allow WebSocket server (port 8091) - ALL NETWORKS
-New-NetFirewallRule `
-    -DisplayName "Van System - WebSocket Server" `
-    -Direction Inbound `
-    -LocalPort 8091 `
-    -Protocol TCP `
-    -Action Allow `
-    -Profile Any `
-    -ErrorAction SilentlyContinue
-Write-Host "✓ Port 8091 (WebSocket Server) - Allowed for ALL networks" -ForegroundColor Green
-
-# Allow RTSP converter (port 8092) - ALL NETWORKS
-New-NetFirewallRule `
-    -DisplayName "Van System - RTSP Converter" `
-    -Direction Inbound `
-    -LocalPort 8092 `
-    -Protocol TCP `
-    -Action Allow `
-    -Profile Any `
-    -ErrorAction SilentlyContinue
-Write-Host "✓ Port 8092 (RTSP Converter) - Allowed for ALL networks" -ForegroundColor Green
+    Write-Host ("[OK] Port {0} ({1}) - Allowed for all networks" -f $rule.Port, $rule.Label) -ForegroundColor Green
+}
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan

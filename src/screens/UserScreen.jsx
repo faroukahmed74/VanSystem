@@ -1320,6 +1320,9 @@ function UserScreen() {
           <header className="user-main-header">
             <div className="user-header-top">
               <h1>User Page</h1>
+              <span className="user-header-credit" aria-hidden="true">
+                تطوير وتصميم المنظومة .. نقيب / احمد فاروق
+              </span>
               <div className="header-buttons">
                 <button 
                   onClick={() => navigate('/editor')}
