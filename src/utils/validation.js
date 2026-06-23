@@ -25,6 +25,41 @@ export function isValidIP(ip) {
   return true
 }
 
+export function normalizeIp(ip) {
+  return (ip || '').trim()
+}
+
+export function getButtonIp(button) {
+  if (!button) return ''
+
+  if (button.ip) {
+    return normalizeIp(button.ip)
+  }
+
+  if (button.url) {
+    const match = button.url.match(/rtsp:\/\/([^:/]+)/i)
+    if (match) {
+      return normalizeIp(match[1])
+    }
+  }
+
+  return ''
+}
+
+export function findDuplicateIp(ip, buttons, excludeButtonId = null) {
+  const normalized = normalizeIp(ip)
+  if (!normalized || !Array.isArray(buttons)) return null
+
+  return (
+    buttons.find((button) => {
+      if (excludeButtonId != null && button.id === excludeButtonId) {
+        return false
+      }
+      return getButtonIp(button) === normalized
+    }) || null
+  )
+}
+
 export function validateInput(ip, directorateName) {
   const errors = []
   

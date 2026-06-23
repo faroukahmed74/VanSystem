@@ -2,7 +2,7 @@ import React, { useState, useContext, useEffect, useRef, useCallback } from 'rea
 import { useNavigate } from 'react-router-dom'
 import { StreamContext } from '../context/StreamContext'
 import { createWebSocketConnection, sendWebSocketMessage, reconnectWebSocket } from '../utils/websocket'
-import { validateInput } from '../utils/validation'
+import { validateInput, findDuplicateIp } from '../utils/validation'
 import { loadSavedButtons, saveButtons } from '../utils/storage'
 import Notification from '../components/Notification'
 import './EditorScreen.css'
@@ -187,6 +187,16 @@ function EditorScreen() {
 
     const trimmedIp = ip.trim()
     const trimmedName = directorateName.trim()
+
+    const duplicateButton = findDuplicateIp(trimmedIp, savedButtons)
+    if (duplicateButton) {
+      showNotification(
+        `This IP address is already saved as "${duplicateButton.name}"`,
+        'error'
+      )
+      return
+    }
+
     const rtspUrl = `rtsp://${trimmedIp}:8000/media/video2`
     const newButton = {
       id: Date.now(),
@@ -438,6 +448,16 @@ function EditorScreen() {
 
     const trimmedIp = editIp.trim()
     const trimmedName = editName.trim()
+
+    const duplicateButton = findDuplicateIp(trimmedIp, savedButtons, editingButton.id)
+    if (duplicateButton) {
+      showNotification(
+        `This IP address is already used by "${duplicateButton.name}"`,
+        'error'
+      )
+      return
+    }
+
     const rtspUrl = `rtsp://${trimmedIp}:${port}/media/video2`
     
     const updatedButtons = savedButtons.map(btn => 
